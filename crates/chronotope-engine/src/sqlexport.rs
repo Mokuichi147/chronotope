@@ -465,6 +465,7 @@ impl KnowledgeBase {
                 s(r.temporal_contested),
                 r.order_label.map(|o| o.start_ord.to_string()),
                 r.order_label.map(|o| o.end_ord.to_string()),
+                r.placement_inherited_from.and_then(|x| uuid(&x.0)),
                 geo.as_ref().and_then(|g| uuid(&g.frame.0)),
                 geo.map(|g| {
                     let (a, b) = g.geometry.bbox();
@@ -512,6 +513,7 @@ impl KnowledgeBase {
                 "temporal_contested",
                 "order_start",
                 "order_end",
+                "geo_inherited_from",
                 "geo_frame",
                 "geo_bbox",
                 "space_ids",

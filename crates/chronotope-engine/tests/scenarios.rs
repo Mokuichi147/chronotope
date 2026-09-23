@@ -124,13 +124,15 @@ fn spatiotemporal_search_and_drilldown() {
     let res = q(&kb, &agent(), json!({ "op": "search", "budget_ms": 500, "types": ["Event"], "time": { "expression": "2026年8月" } }));
     assert!(res["results"].as_array().unwrap().is_empty());
 
-    // 近傍検索（座標は東京駅から継承）
-    let near = q(
-        &kb,
-        &agent(),
-        json!({ "op": "search", "budget_ms": 500, "types": ["Event"], "space": { "near": { "at": { "frame": format!("frm_{}", chronotope_core::FrameId::named("wgs84").0.simple()), "geometry": { "type": "point", "at": { "x": 139.77, "y": 35.68 } } }, "radius": 2000.0 } } }),
-    );
+    // 近傍検索: イベント自身は座標を持たず、東京駅の座標を代用しているだけなので既定では除外する。
+    let wgs = format!("frm_{}", chronotope_core::FrameId::named("wgs84").0.simple());
+    let near_q = |inherit: bool| json!({ "op": "search", "budget_ms": 500, "types": ["Event"], "space": { "near": { "at": { "frame": wgs, "geometry": { "type": "point", "at": { "x": 139.77, "y": 35.68 } } }, "radius": 2000.0 }, "include_inherited": inherit } });
+    let near = q(&kb, &agent(), near_q(false));
+    assert!(near["results"].as_array().unwrap().is_empty());
+    assert!(near["warnings"][0].as_str().unwrap().contains("include_inherited"));
+    let near = q(&kb, &agent(), near_q(true));
     assert_eq!(near["results"].as_array().unwrap().len(), 1);
+    assert_eq!(near["results"][0]["placement"]["inherited_from"]["label"], "東京駅");
 
     // Level 2
     let claims = q(&kb, &agent(), json!({ "op": "expand_claims", "budget_ms": 500, "id": event, "include_incoming": true }));
@@ -152,6 +154,38 @@ fn spatiotemporal_search_and_drilldown() {
     // 旧抽出器由来の Assertion 検索
     let old = q(&kb, &agent(), json!({ "op": "derived_by", "budget_ms": 500, "model_version": "2026-08" }));
     assert_eq!(old["results"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn coordinates_are_inherited_only_from_a_single_most_specific_place() {
+    let mut kb = kb();
+    let wgs = format!("frm_{}", chronotope_core::FrameId::named("wgs84").0.simple());
+    let geo = |x: f64, y: f64| json!({ "geo": { "frame": wgs, "geometry": { "type": "point", "at": { "x": x, "y": y } } } });
+    let country = create(&mut kb, &["Country"], "国X");
+    let north = create(&mut kb, &["Region"], "地域A");
+    let south = create(&mut kb, &["Region"], "地域B");
+    assert_accepted(&mut kb, &country, "coordinates", geo(136.0, 35.0));
+    assert_accepted(&mut kb, &north, "coordinates", geo(140.0, 39.0));
+    assert_accepted(&mut kb, &south, "coordinates", geo(141.0, 40.0));
+    for r in [&north, &south] {
+        assert_accepted(&mut kb, r, "located_in", json!({ "resource": country }));
+    }
+    // 国だけ → 国の代表点を代用（明示）。地域 A・B の両方 → 一意でないので代用しない。
+    let a = create(&mut kb, &["Event"], "地震A");
+    assert_accepted(&mut kb, &a, "took_place_at", json!({ "resource": country }));
+    let b = create(&mut kb, &["Event"], "地震B");
+    for p in [&country, &north, &south] {
+        assert_accepted(&mut kb, &b, "took_place_at", json!({ "resource": p }));
+    }
+    let c = create(&mut kb, &["Event"], "地震C");
+    for p in [&country, &north] {
+        assert_accepted(&mut kb, &c, "took_place_at", json!({ "resource": p }));
+    }
+    kb.materialize_all().unwrap();
+    let look = |id: &str| q(&kb, &agent(), json!({ "op": "lookup", "budget_ms": 50, "id": id }))["results"]["matches"][0].clone();
+    assert_eq!(look(&a)["placement"]["inherited_from"]["label"], "国X");
+    assert!(look(&b)["placement"].is_null());
+    assert_eq!(look(&c)["placement"]["inherited_from"]["label"], "地域A");
 }
 
 #[test]

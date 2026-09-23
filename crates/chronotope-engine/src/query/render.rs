@@ -176,6 +176,10 @@ impl QCtx<'_> {
         if !places.is_empty() {
             j["places"] = json!(places);
         }
+        if let Some(from) = row.placement_inherited_from {
+            j["placement"] =
+                json!({ "inherited_from": { "id": from, "label": self.label_of(from) }, "note": "coordinates of the location, not of this resource" });
+        }
         if !row.redistributable {
             j["redistributable"] = json!(false);
         }

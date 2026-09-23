@@ -165,6 +165,8 @@ pub(super) fn search(ctx: &QCtx, branch: BranchId, spec: &SearchSpec) -> Result<
         ff.works.push(id);
     }
     let mut near_check: Option<(Placement, f64)> = None;
+    let mut geo_filter = false;
+    let include_inherited = spec.space.as_ref().is_some_and(|s| s.include_inherited);
     if let Some(sp) = &spec.space {
         if let Some(pl) = &sp.within_place {
             let id = ctx.resolve(pl)?;
@@ -177,6 +179,7 @@ pub(super) fn search(ctx: &QCtx, branch: BranchId, spec: &SearchSpec) -> Result<
                 .intersecting(&store.frames, bb)
                 .ok_or_else(|| Error::Incomparable(format!("frame {} is unknown or has no coordinate mapping", bb.frame)))?;
             and(&mut cand, bm);
+            geo_filter = true;
         }
         if let Some(n) = &sp.near {
             let root = store.frames.to_root(&n.at).ok_or_else(|| Error::Incomparable(format!("frame {} is unknown", n.at.frame)))?;
@@ -190,6 +193,7 @@ pub(super) fn search(ctx: &QCtx, branch: BranchId, spec: &SearchSpec) -> Result<
             let bb = Placement { frame: root.frame, geometry: Geometry::BBox { min: Point::xy(c.x - dx, c.y - dy), max: Point::xy(c.x + dx, c.y + dy) } };
             and(&mut cand, p.idx_geo.intersecting(&store.frames, &bb).unwrap_or_default());
             near_check = Some((n.at.clone(), n.radius));
+            geo_filter = true;
         }
     }
     if let Some(text) = &spec.text {
@@ -292,6 +296,7 @@ pub(super) fn search(ctx: &QCtx, branch: BranchId, spec: &SearchSpec) -> Result<
     let facts = ctx.facts();
     let mut results = vec![];
     let mut other_axis = 0usize;
+    let mut inherited_skipped = 0usize;
     let mut sorted_tail = head >= scored.len();
     let mut i = 0;
     while i < scored.len() && results.len() < limit {
@@ -329,6 +334,10 @@ pub(super) fn search(ctx: &QCtx, branch: BranchId, spec: &SearchSpec) -> Result<
                 None => {}
             }
         }
+        if geo_filter && row.placement_inherited_from.is_some() && !include_inherited {
+            inherited_skipped += 1;
+            continue;
+        }
         if let Some((at, r)) = &near_check {
             match row.placement.as_ref().and_then(|pl| store.frames.distance(pl, at)) {
                 Some(d) if d <= *r => {}
@@ -364,6 +373,11 @@ pub(super) fn search(ctx: &QCtx, branch: BranchId, spec: &SearchSpec) -> Result<
             summary["score"] = json!((score * 1000.0).round() / 1000.0);
         }
         results.push(summary);
+    }
+    if inherited_skipped > 0 {
+        ctx.warn(format!(
+            "{inherited_skipped} candidates only have coordinates inherited from their location and were excluded; set space.include_inherited to include them"
+        ));
     }
     if other_axis > 0 {
         ctx.warn(format!("{other_axis} candidates use a different time axis and were excluded (comparable: false)"));

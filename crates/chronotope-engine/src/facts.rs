@@ -72,6 +72,8 @@ pub struct ResourceFacts {
     pub types: BTreeSet<ResourceId>,
     pub time: Option<TimeSlot>,
     pub placement: Option<Placement>,
+    /// 自前の座標が無く、所在地の座標を代用している場合の代用元。
+    pub placement_inherited_from: Option<ResourceId>,
     pub places: Vec<ResourceId>,
     pub place_ancestors: Vec<ResourceId>,
     pub entities: Vec<ResourceId>,
@@ -486,6 +488,23 @@ impl<'a> Facts<'a> {
         seen
     }
 
+    /// 自前の座標を持たない Resource が代用できる所在地の座標。
+    /// 最も具体的な所在地（他の所在地の祖先でないもの）が 1 つに定まり、それが座標を持つ場合だけ返す。
+    /// 候補が複数（隣り合う 2 つの地域など）なら代用しない。国などの広域の代表点になり得るため、
+    /// 検索側では既定で空間条件の判定に使わない。
+    fn inherited_placement(&self, id: ResourceId, places: &[ResourceId]) -> Option<(ResourceId, Placement)> {
+        let s = self.store;
+        let cands: Vec<ResourceId> = places.iter().copied().filter(|p| *p != id).collect();
+        let ancestors: Vec<Vec<ResourceId>> =
+            cands.iter().map(|p| self.closure(&[*p], |x| self.place_parents(x)).into_iter().filter(|a| a != p).collect()).collect();
+        let leaves: Vec<ResourceId> = cands.iter().copied().filter(|p| !ancestors.iter().any(|anc| anc.contains(p))).collect();
+        let [leaf] = leaves.as_slice() else { return None };
+        s.claims_about(*leaf, self.view).into_iter().find_map(|(a, st)| match (&a.object, st.is_live(), s.role_of(&a.predicate)) {
+            (Value::Geo(g), true, PredicateRole::Coordinates) => Some((*leaf, g.clone())),
+            _ => None,
+        })
+    }
+
     pub fn work_parents(&self, work: ResourceId) -> Vec<ResourceId> {
         let s = self.store;
         self.live_affirmed(s.claims_about(work, self.view))
@@ -526,20 +545,17 @@ impl<'a> Facts<'a> {
         places.dedup();
         let place_ancestors = self.closure(&places, |p| self.place_parents(p));
 
-        let placement = preferred_of_role(PredicateRole::Coordinates)
-            .first()
-            .and_then(|a| match &a.object {
-                Value::Geo(p) => Some(p.clone()),
-                _ => None,
-            })
-            .or_else(|| {
-                places.iter().filter(|p| **p != id).find_map(|p| {
-                    s.claims_about(*p, self.view).into_iter().find_map(|(a, st)| match (&a.object, st.is_live(), s.role_of(&a.predicate)) {
-                        (Value::Geo(g), true, PredicateRole::Coordinates) => Some(g.clone()),
-                        _ => None,
-                    })
-                })
-            });
+        let own_placement = preferred_of_role(PredicateRole::Coordinates).first().and_then(|a| match &a.object {
+            Value::Geo(p) => Some(p.clone()),
+            _ => None,
+        });
+        let (placement, placement_inherited_from) = match own_placement {
+            Some(p) => (Some(p), None),
+            None => match self.inherited_placement(id, &places) {
+                Some((from, p)) => (Some(p), Some(from)),
+                None => (None, None),
+            },
+        };
 
         let mut works: Vec<ResourceId> =
             preferred_of_role(PredicateRole::WorkMembership).iter().filter_map(|a| a.object.as_resource()).map(|o| s.resolve_id(o)).collect();
@@ -612,6 +628,7 @@ impl<'a> Facts<'a> {
             types,
             time,
             placement,
+            placement_inherited_from,
             places,
             place_ancestors,
             entities,

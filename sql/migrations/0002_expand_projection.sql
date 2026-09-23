@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS search_projection (
     temporal_contested  boolean NOT NULL DEFAULT false,
     order_start         bigint,               -- Temporal Order Label（アクセラレータ）
     order_end           bigint,
+    geo_inherited_from  uuid,                 -- 自前の座標が無く所在地の座標を代用している場合の代用元
     geo_frame           uuid,
     geo_bbox            box,                  -- 基準 Frame 上の bbox
     space_ids           uuid[]  NOT NULL DEFAULT '{}',
@@ -50,7 +51,9 @@ CREATE TABLE IF NOT EXISTS search_projection (
 );
 
 CREATE INDEX IF NOT EXISTS sp_time_gist ON search_projection USING gist (branch_id, temporal_possible);
-CREATE INDEX IF NOT EXISTS sp_geo_gist ON search_projection USING gist (geo_bbox) WHERE geo_bbox IS NOT NULL;
+-- 空間条件は既定で自前の座標だけで判定する（代用座標は国の代表点などになり得るため）。
+CREATE INDEX IF NOT EXISTS sp_geo_gist ON search_projection USING gist (geo_bbox) WHERE geo_bbox IS NOT NULL AND geo_inherited_from IS NULL;
+CREATE INDEX IF NOT EXISTS sp_geo_inherited_gist ON search_projection USING gist (geo_bbox) WHERE geo_inherited_from IS NOT NULL;
 CREATE INDEX IF NOT EXISTS sp_space_anc_gin ON search_projection USING gin (space_ancestor_ids);
 CREATE INDEX IF NOT EXISTS sp_entity_gin ON search_projection USING gin (entity_ids);
 CREATE INDEX IF NOT EXISTS sp_work_gin ON search_projection USING gin (work_ids);

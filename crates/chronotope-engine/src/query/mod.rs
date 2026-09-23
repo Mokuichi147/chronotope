@@ -87,6 +87,9 @@ pub struct SpaceFilter {
     pub bbox: Option<Placement>,
     #[serde(default)]
     pub near: Option<Near>,
+    /// bbox / near の判定に、所在地から代用した座標も使うか（既定: 使わない）。
+    #[serde(default)]
+    pub include_inherited: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
