@@ -3,7 +3,7 @@
 //! 取り込み主体の権限はそのまま適用される（AI・クローラーの主張は proposed から始まる）。
 //! すべての主張に、取得（Acquisition）と抽出（Derivation: 抽出器・モデル・スキーマ版・本文中の位置・確信度）を付ける。
 
-use crate::link::{LinkDecision, link};
+use crate::link::{LinkDecision, link, link_within};
 use crate::schema::*;
 use chronotope_core::model::Principal;
 use chronotope_core::time::Tick;
@@ -102,6 +102,29 @@ pub fn ingest(kb: &mut KnowledgeBase, p: &Principal, doc: &Document, x: &Extract
         .iter()
         .map(|e| EntityOutcome { reference: e.reference.clone(), label: e.label.clone(), types: e.types.clone(), decision: link(kb, e), resource: None })
         .collect();
+    // 抽出器が「〇〇の配下」と記録した実体は、その親の配下にある既存だけに結び付ける。
+    // 親が既存に結び付かない場合は、同名の別地域に結び付けないよう新規にする。
+    let parent_of: HashMap<&str, &str> = x
+        .claims
+        .iter()
+        .filter(|c| c.predicate == "located_in")
+        .filter_map(|c| match &c.object {
+            ObjectMention::Ref { reference } => Some((c.subject.as_str(), reference.as_str())),
+            _ => None,
+        })
+        .collect();
+    let decided: HashMap<String, LinkDecision> = entities.iter().map(|o| (o.reference.clone(), o.decision.clone())).collect();
+    for (o, e) in entities.iter_mut().zip(&x.entities) {
+        if e.resource.is_some() {
+            continue;
+        }
+        if let Some(parent) = parent_of.get(o.reference.as_str()) {
+            o.decision = match decided.get(*parent) {
+                Some(LinkDecision::Existing { resource, .. }) => link_within(kb, e, Some(*resource)),
+                _ => LinkDecision::New,
+            };
+        }
+    }
     for o in &entities {
         if let LinkDecision::Ambiguous { candidates } = &o.decision {
             warnings.push(format!(

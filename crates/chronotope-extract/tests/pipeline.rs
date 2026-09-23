@@ -135,6 +135,36 @@ fn external_extraction_json_is_accepted() {
 }
 
 #[test]
+fn places_under_a_known_parent_link_only_within_it() {
+    let mut kb = KnowledgeBase::in_memory(KbConfig::default());
+    let mk = |kb: &mut KnowledgeBase, types: &[&str], label: &str| {
+        w(kb, json!({ "op": "create_resource", "resource": { "types": types, "label": label, "lang": "ja" } }))["id"].as_str().unwrap().to_string()
+    };
+    let (a_pref, a_city, b_pref, b_ward) =
+        (mk(&mut kb, &["Region"], "山川県"), mk(&mut kb, &["City"], "海辺市"), mk(&mut kb, &["Region"], "谷原県"), mk(&mut kb, &["City"], "本町"));
+    for (s, o) in [(&a_city, &a_pref), (&b_ward, &b_pref)] {
+        w(&mut kb, json!({ "op": "propose_assertion", "subject": s, "predicate": "located_in", "object": { "resource": o }, "status": "accepted" }));
+    }
+    // 谷原県の本町ではなく、海辺市の配下の（KB に無い）本町
+    let x: Extraction = serde_json::from_value(json!({
+        "extractor": { "name": "t" },
+        "entities": [
+            { "ref": "E1", "types": ["Event"], "label": "火災" },
+            { "ref": "P1", "types": ["City"], "label": "海辺市", "resource": a_city },
+            { "ref": "P2", "types": ["City"], "label": "本町" }
+        ],
+        "claims": [
+            { "subject": "E1", "predicate": "took_place_at", "object": { "ref": "P2" } },
+            { "subject": "P2", "predicate": "located_in", "object": { "ref": "P1" } }
+        ]
+    }))
+    .unwrap();
+    let d: Document = serde_json::from_value(json!({ "text": "海辺市本町で火災が発生した。", "acquired_at": "2026-01-01T00:00:00Z" })).unwrap();
+    let r = ingest(&mut kb, &crawler(), &d, &x, &IngestOptions { dry_run: true }).unwrap();
+    assert_eq!(r.entities[2].decision, LinkDecision::New, "{:?}", r.entities[2]);
+}
+
+#[test]
 fn works_with_the_real_clock() {
     // 実時計の取得・抽出時刻はミリ秒を含む。固定時計のテストでは見えない失敗を防ぐ。
     let mut kb = KnowledgeBase::in_memory(KbConfig::default());

@@ -147,8 +147,9 @@ impl Resolver<'_, '_> {
                 let reference = if date.year.is_none() { Some(self.reference()?) } else { self.ctx.reference };
                 let (s, e) = cal.date_bounds(date, reference).map_err(|e| Unresolved::new(UnresolvedKind::Unsupported, e.to_string()))?;
                 let r = FuzzyRange::within(s, e);
-                // 旧暦の月日は新暦でおおむね 1 か月前後ずれるため、前後 45 日を可能範囲に含める。
-                Ok((if date.calendar_uncertain { r.widen(45 * super::TICKS_PER_DAY) } else { r }, None))
+                // 旧暦（太陰太陽暦）の月日は、同じ数字の新暦の月日より 3 週間〜 2 か月ほど遅い。
+                // 対応表を持たないため、可能範囲を後ろへ 60 日延ばして取りこぼさないようにする。
+                Ok((if date.calendar_uncertain { FuzzyRange::within(r.earliest_start, r.latest_end.offset(60 * super::TICKS_PER_DAY)) } else { r }, None))
             }
             TimeAst::Approx { inner } => {
                 let (r, rec) = self.ast(inner)?;

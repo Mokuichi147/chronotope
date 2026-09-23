@@ -103,6 +103,9 @@ fn inherit_date_context(start: &TimeAst, end: &mut TimeAst) {
         if e.month.is_none() && e.day.is_some() && s.month.is_some() {
             e.month = s.month;
         }
+        // 旧暦・ユリウス暦の指定も終端に引き継ぐ（`旧暦1500年9月1日から2日`）。
+        e.calendar_uncertain |= s.calendar_uncertain;
+        e.julian |= s.julian;
         // 「来月10日から12日まで」の終端も同じ相対月。
         if e.year.is_none() && e.month.is_none() && e.year_offset.is_none() && e.month_offset.is_none() {
             e.year_offset = s.year_offset;
@@ -554,7 +557,8 @@ fn parse_recurring(s: &str) -> Result<Option<TimeAst>> {
 /// 日本史の時代区分（おおよその西暦年の範囲 [開始, 終了)）。
 pub const JAPANESE_PERIODS: &[(&str, i64, i64)] = &[
     ("安土桃山時代", 1568, 1600),
-    ("南北朝時代", 1336, 1392),
+    // 元弘の乱（1331年）からとする広い定義
+    ("南北朝時代", 1331, 1392),
     ("飛鳥時代", 592, 710),
     ("奈良時代", 710, 794),
     ("平安時代", 794, 1185),
@@ -753,7 +757,10 @@ fn month_from_en(s: &str) -> Option<(u32, &str)> {
 }
 
 fn parse_date(input: &str) -> Result<DateSpec> {
-    let mut s = input.trim();
+    // 「旧暦」（`旧暦1500年4月` `1500年旧暦4月`）は太陰太陽暦の日付であることを示す。
+    let lunisolar = input.contains("旧暦");
+    let without = input.replace("旧暦", "");
+    let mut s = without.trim();
     let mut bc = false;
     for pre in ["紀元前", "bc ", "bce ", "b.c. "] {
         if let Some(r) = s.strip_prefix(pre) {
@@ -794,6 +801,7 @@ fn parse_date(input: &str) -> Result<DateSpec> {
         }
     }
     spec.julian = julian;
+    spec.calendar_uncertain |= lunisolar;
     spec.validate()?;
     Ok(spec)
 }
@@ -1073,6 +1081,18 @@ mod tests {
         let early = r("江戸時代前期");
         assert_eq!(early.latest_end, crate::time::Tick::from_civil(1692, 1, 1, 0, 0, 0, 0));
         assert!(parse_expression("江戸時代の人々").is_err());
+        // 旧暦の月は新暦で遅れる方向に幅を持たせる
+        let lunar = r("旧暦1500年4月");
+        assert_eq!(
+            (lunar.earliest_start, lunar.latest_end),
+            (crate::time::Tick::from_civil(1500, 4, 1, 0, 0, 0, 0), crate::time::Tick::from_civil(1500, 6, 30, 0, 0, 0, 0))
+        );
+        assert_eq!(r("1500年旧暦4月"), lunar);
+        // 区間の終端にも旧暦の幅が付く
+        let lunar_span = r("旧暦1500年9月1日から2日");
+        assert_eq!(lunar_span.latest_end, crate::time::Tick::from_civil(1500, 11, 2, 0, 0, 0, 0));
+        let span = r("旧暦1500年から旧暦1501年");
+        assert_eq!(span.earliest_start, crate::time::Tick::from_civil(1500, 1, 1, 0, 0, 0, 0));
     }
 
     #[test]

@@ -32,6 +32,60 @@ fn compatible(kb: &KnowledgeBase, mention_types: &BTreeSet<ResourceId>, candidat
     cand.iter().any(|t| *t != root && mention_types.contains(t))
 }
 
+/// 場所 `child` が `ancestor` の配下か（located_in / inside / contains をたどる）。
+pub fn within(kb: &KnowledgeBase, child: ResourceId, ancestor: ResourceId) -> bool {
+    let s = kb.store();
+    let preds: Vec<(ResourceId, bool)> =
+        ["located_in", "inside", "contains"].iter().filter_map(|k| s.predicate_by_key.get(*k).map(|p| (*p, *k == "contains"))).collect();
+    let mut stack = vec![child];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(x) = stack.pop() {
+        if !seen.insert(x) || seen.len() > 64 {
+            continue;
+        }
+        let mut parents: Vec<ResourceId> = vec![];
+        for aid in s.by_subject.get(&x).into_iter().flatten() {
+            let a = &s.assertions[aid];
+            if preds.iter().any(|(p, rev)| *p == a.predicate && !rev) && a.status.is_live() {
+                parents.extend(a.object.as_resource());
+            }
+        }
+        if let Some((cp, _)) = preds.iter().find(|(_, rev)| *rev) {
+            for aid in s.by_object_predicate.get(&(x, *cp)).into_iter().flatten() {
+                if s.assertions[aid].status.is_live() {
+                    parents.push(s.assertions[aid].subject);
+                }
+            }
+        }
+        for p in parents {
+            let p = s.resolve_id(p);
+            if p == ancestor {
+                return true;
+            }
+            stack.push(p);
+        }
+    }
+    false
+}
+
+/// 抽出器が「`parent` の配下」と記録した実体の照合。同名の別地域（`海辺市本町` を別県の `本町`）を避けるため、
+/// 候補が `parent` の配下にある場合だけ既存に結び付ける。
+pub fn link_within(kb: &KnowledgeBase, e: &EntityMention, parent: Option<ResourceId>) -> LinkDecision {
+    let d = link(kb, e);
+    match (d, parent) {
+        (LinkDecision::Existing { resource, via: "label" }, Some(p)) if !within(kb, resource, p) => LinkDecision::New,
+        (LinkDecision::Ambiguous { candidates }, Some(p)) => {
+            let inside: Vec<ResourceId> = candidates.into_iter().filter(|c| within(kb, *c, p)).collect();
+            match inside.as_slice() {
+                [] => LinkDecision::New,
+                [one] => LinkDecision::Existing { resource: *one, via: "label" },
+                _ => LinkDecision::Ambiguous { candidates: inside },
+            }
+        }
+        (d, _) => d,
+    }
+}
+
 pub fn link(kb: &KnowledgeBase, e: &EntityMention) -> LinkDecision {
     if let Some(r) = &e.resource {
         if let Ok(id) = kb.resolve_ref_str(r) {
