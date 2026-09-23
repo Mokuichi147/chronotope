@@ -6,6 +6,7 @@
 //! - `GET  /v1/freshness?branch=` … Projection の鮮度
 //! - `GET  /v1/export/rdf?branch=` … N-Triples（再配布可能な承認済み主張のみ）
 //! - `POST /v1/materialize` … Materializer を即時実行
+//! - `POST /v1/ingest/text` … テキストから主張を抽出して取り込む（規則ベース、または渡された抽出結果）
 //!
 //! 認証は前段のゲートウェイで行う前提で、主体はヘッダ
 //! `x-chronotope-principal` / `x-chronotope-kind` / `x-chronotope-groups` / `x-chronotope-curator` から作る。
@@ -120,6 +121,30 @@ async fn export_rdf(State(kb): State<Shared>, Query(q): Query<BranchParam>) -> R
     Ok(([("content-type", "application/n-triples; charset=utf-8")], r))
 }
 
+#[derive(Deserialize)]
+struct IngestText {
+    document: chronotope_extract::Document,
+    /// 外部抽出器の出力（省略時は組み込みの規則ベース抽出器）。
+    #[serde(default)]
+    extraction: Option<chronotope_extract::Extraction>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn ingest_text(State(kb): State<Shared>, headers: HeaderMap, body: String) -> Result<impl IntoResponse, ApiError> {
+    let p = principal(&headers);
+    let req: IngestText = serde_json::from_str(&body).map_err(|e| ApiError(Error::invalid(format!("ingest: {e}"))))?;
+    let r = blocking(move || {
+        let x = match req.extraction {
+            Some(x) => x,
+            None => chronotope_extract::RuleExtractor::from_kb(&kb.read()).extract(&req.document),
+        };
+        chronotope_extract::ingest(&mut kb.write(), &p, &req.document, &x, &chronotope_extract::IngestOptions { dry_run: req.dry_run })
+    })
+    .await?;
+    Ok(Json(r))
+}
+
 async fn materialize(State(kb): State<Shared>) -> Result<impl IntoResponse, ApiError> {
     let n = blocking(move || kb.write().materialize_all()).await?;
     Ok(Json(json!({ "processed": n })))
@@ -160,6 +185,7 @@ pub async fn serve(kb: KnowledgeBase, addr: &str, interval_ms: u64) -> Result<()
         .route("/v1/freshness", get(freshness))
         .route("/v1/export/rdf", get(export_rdf))
         .route("/v1/materialize", post(materialize))
+        .route("/v1/ingest/text", post(ingest_text))
         .with_state(shared);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "chronotope agent API listening");

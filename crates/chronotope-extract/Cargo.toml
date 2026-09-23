@@ -1,0 +1,16 @@
+[package]
+name = "chronotope-extract"
+description = "Text extraction pipeline: extraction schema, rule-based extractor, entity linking and ingestion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chronotope-core.workspace = true
+chronotope-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

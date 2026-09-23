@@ -211,5 +211,10 @@ mod tests {
         assert_eq!(t.to_iso(), "2026-09-20T06:30:00Z");
         assert_eq!(Tick::parse_iso("2026-09-20T06:30:00Z").unwrap(), t);
         assert_eq!(Tick::parse_iso("2026-09-20T15:30+09:00").unwrap(), t);
+        // 小数秒（Tick::to_iso の出力を含む）も往復できる。
+        let ms = Tick(t.0 + 18_982);
+        assert_eq!(ms.to_iso(), "2026-09-20T06:30:18.982Z");
+        assert_eq!(Tick::parse_iso(&ms.to_iso()).unwrap(), ms);
+        assert_eq!(Tick::parse_iso("2026-09-20T06:30:18.9824Z").unwrap(), ms);
     }
 }

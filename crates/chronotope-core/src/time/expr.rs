@@ -92,7 +92,7 @@ impl TimeAst {
     /// 参照時刻（情報源の公開時刻など）が必要な式か。
     pub fn needs_reference(&self) -> bool {
         match self {
-            TimeAst::Date { date } => date.year.is_none(),
+            TimeAst::Date { date } => date.year.is_none() || date.year_offset.is_some() || date.month_offset.is_some(),
             TimeAst::Approx { inner } => inner.needs_reference(),
             TimeAst::Interval { start, end } => start.needs_reference() || end.needs_reference(),
             TimeAst::Relative { anchor, .. } => matches!(anchor, Anchor::Reference),
@@ -159,6 +159,9 @@ pub struct TimeOfDay {
     pub minute: u32,
     #[serde(default)]
     pub second: u32,
+    /// ミリ秒（`15:30:18.982` の小数秒）。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub millis: u32,
     /// 精度: 分・秒を明示したか。
     #[serde(default)]
     pub precision: ClockPrecision,
@@ -171,6 +174,11 @@ pub enum ClockPrecision {
     #[default]
     Minute,
     Second,
+    Millisecond,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 impl TimeOfDay {
@@ -184,12 +192,13 @@ impl TimeOfDay {
             ClockPrecision::Hour => TICKS_PER_HOUR,
             ClockPrecision::Minute => TICKS_PER_MINUTE,
             ClockPrecision::Second => TICKS_PER_SECOND,
+            ClockPrecision::Millisecond => 1,
         }
     }
 
     /// 日の開始からの tick（day_offset 込み）。
     pub fn offset_ticks(&self) -> i64 {
-        self.hour as i64 * TICKS_PER_HOUR + self.minute as i64 * TICKS_PER_MINUTE + self.second as i64 * TICKS_PER_SECOND
+        self.hour as i64 * TICKS_PER_HOUR + self.minute as i64 * TICKS_PER_MINUTE + self.second as i64 * TICKS_PER_SECOND + self.millis as i64
     }
 }
 
@@ -299,6 +308,36 @@ pub struct DateSpec {
     /// 明示されたタイムゾーン（分）。
     #[serde(default)]
     pub utc_offset_minutes: Option<i32>,
+    /// 参照時刻からの年の相対（`昨年9月` → -1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year_offset: Option<i32>,
+    /// 参照時刻からの月の相対（`来月10日` → +1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub month_offset: Option<i32>,
+    /// 旧暦（明治 5 年以前など）で書かれ、グレゴリオ暦の月日との対応が近似であること。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub calendar_uncertain: bool,
+    /// ユリウス暦の日付（`ユリウス暦1200年6月1日`）。グレゴリオ暦に換算して解決する。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub julian: bool,
+}
+
+/// ユリウス暦の日付 → 1970-01-01（グレゴリオ暦）からの日数。
+pub fn days_from_julian(y: i64, m: u32, d: u32) -> i64 {
+    let a = (14 - m as i64) / 12;
+    let y2 = y + 4800 - a;
+    let m2 = m as i64 + 12 * a - 3;
+    let jdn = d as i64 + (153 * m2 + 2) / 5 + 365 * y2 + y2.div_euclid(4) - 32083;
+    jdn - 2_440_588
+}
+
+fn julian_days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        2 if y.rem_euclid(4) == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 impl DateSpec {
@@ -330,11 +369,13 @@ impl DateSpec {
         self.validate()?;
         let y = self.year.ok_or_else(|| Error::Parse("year required".into()))?;
         let off = self.utc_offset_minutes.unwrap_or(default_offset) as i64 * TICKS_PER_MINUTE;
+        let civil = |y: i64, m: u32, d: u32| if self.julian { days_from_julian(y, m, d) } else { days_from_civil(y, m, d) };
+        let dim = |y: i64, m: u32| if self.julian { julian_days_in_month(y, m) } else { days_in_month(y, m) };
         let (d0, d1) = match (self.month, self.day) {
-            (None, _) => (days_from_civil(y, 1, 1), days_from_civil(y + 1, 1, 1)),
+            (None, _) => (civil(y, 1, 1), civil(y + 1, 1, 1)),
             (Some(m), None) => {
-                let first = days_from_civil(y, m, 1);
-                let n = days_in_month(y, m) as i64;
+                let first = civil(y, m, 1);
+                let n = dim(y, m) as i64;
                 match self.month_part {
                     None => (first, first + n),
                     Some(MonthPart::Early) => (first, first + 10),
@@ -343,7 +384,7 @@ impl DateSpec {
                 }
             }
             (Some(m), Some(d)) => {
-                let z = days_from_civil(y, m, d);
+                let z = civil(y, m, d);
                 (z, z + 1)
             }
         };

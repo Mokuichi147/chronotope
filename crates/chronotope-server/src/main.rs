@@ -69,6 +69,38 @@ enum Cmd {
         #[arg(long, default_value = "main")]
         branch: String,
     },
+    /// テキスト（記事など）から主張を抽出して取り込む。LLM は使わず、組み込みの規則ベース抽出器か、
+    /// `--extraction` で渡した抽出結果 JSON（任意の抽出器の出力）を使う。
+    IngestText {
+        #[arg(long, default_value = "./data")]
+        data: PathBuf,
+        /// 本文のファイル（`-` で標準入力）。
+        file: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// 公開日時（相対表現の基準）。省略時は本文冒頭の【日付】を使う。
+        #[arg(long)]
+        published: Option<String>,
+        /// 取得日時。省略時は現在時刻。
+        #[arg(long)]
+        acquired_at: Option<String>,
+        #[arg(long)]
+        license: Option<String>,
+        /// 時間表現の暦（既定 gregorian+09:00）。
+        #[arg(long)]
+        calendar: Option<String>,
+        /// 外部の抽出結果（schema: extract-v1）。省略時は規則ベース抽出器。
+        #[arg(long)]
+        extraction: Option<PathBuf>,
+        /// 書き込まずに抽出結果と照合結果だけを表示する。
+        #[arg(long)]
+        dry_run: bool,
+        /// 取り込み主体の ID（種別は crawler。主張は proposed になる）。
+        #[arg(long, default_value = "text-ingest")]
+        principal: String,
+    },
     /// 承認済み・再配布可能な Assertion を N-Triples で出力する。
     ExportRdf {
         #[arg(long, default_value = "./data")]
@@ -123,6 +155,28 @@ fn main() -> anyhow_like::Result<()> {
             kb.materialize_all()?;
             let r = kb.query_json(&Principal::anonymous(), &body)?;
             println!("{}", serde_json::to_string_pretty(&r)?);
+        }
+        Cmd::IngestText { data, file, url, title, published, acquired_at, license, calendar, extraction, dry_run, principal } => {
+            let text = if file == "-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                s
+            } else {
+                std::fs::read_to_string(&file)?
+            };
+            let doc = chronotope_extract::Document { text, url, title, published, acquired_at, license, calendar, lang: None, kind: None, origin: None };
+            let mut kb = KnowledgeBase::open(&data, KbConfig::default())?;
+            let x = match extraction {
+                Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
+                None => chronotope_extract::RuleExtractor::from_kb(&kb).extract(&doc),
+            };
+            let who = chronotope_core::model::Principal {
+                actor: chronotope_core::model::ActorRef { id: principal, kind: chronotope_core::model::ActorKind::Crawler },
+                groups: Default::default(),
+                curator: false,
+            };
+            let report = chronotope_extract::ingest(&mut kb, &who, &doc, &x, &chronotope_extract::IngestOptions { dry_run })?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Cmd::ExportRdf { data, branch } => {
             let mut kb = KnowledgeBase::open(&data, KbConfig::default())?;

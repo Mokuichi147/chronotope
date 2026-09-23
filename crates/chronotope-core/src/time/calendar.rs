@@ -223,6 +223,21 @@ impl CalendarFrame {
             return Err(Error::Incomparable(format!("calendar `{}` has no numeric mapping", self.key)));
         }
         let mut d = *d;
+        if d.year_offset.is_some() || d.month_offset.is_some() {
+            // 「昨年9月」「来月10日」: 参照時刻の年・月からずらす。
+            let r = reference.ok_or_else(|| Error::Invalid("relative year/month needs a reference time".into()))?;
+            let (y, m, _) = self.civil_of(r).ok_or_else(|| Error::invalid("reference outside calendar"))?;
+            let y = y + d.year_offset.unwrap_or(0) as i64;
+            if let Some(mo) = d.month_offset {
+                let (yy, mm) = self.shift_month(y, m, mo as i64).ok_or_else(|| Error::invalid("month arithmetic outside calendar"))?;
+                d.year = Some(yy);
+                d.month = Some(mm);
+            } else {
+                d.year = Some(y);
+            }
+            d.year_offset = None;
+            d.month_offset = None;
+        }
         if d.year.is_none() {
             let r = reference.ok_or_else(|| Error::Invalid("year missing and no reference time".into()))?;
             let (y, m, _) = self.civil_of(r).ok_or_else(|| Error::invalid("reference outside calendar"))?;

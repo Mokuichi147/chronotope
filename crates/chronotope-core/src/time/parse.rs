@@ -103,6 +103,11 @@ fn inherit_date_context(start: &TimeAst, end: &mut TimeAst) {
         if e.month.is_none() && e.day.is_some() && s.month.is_some() {
             e.month = s.month;
         }
+        // 「来月10日から12日まで」の終端も同じ相対月。
+        if e.year.is_none() && e.month.is_none() && e.year_offset.is_none() && e.month_offset.is_none() {
+            e.year_offset = s.year_offset;
+            e.month_offset = s.month_offset;
+        }
     }
 }
 
@@ -173,6 +178,9 @@ fn parse_single(s: &str) -> Result<TimeAst> {
         return Ok(ast);
     }
     if let Some(ast) = parse_decade_century(s) {
+        return Ok(ast);
+    }
+    if let Some(ast) = parse_period(s) {
         return Ok(ast);
     }
     if let Some(ast) = parse_relative_to_event(s)? {
@@ -340,10 +348,10 @@ fn parse_part_of_day(s: &str) -> Option<(Clock, &str)> {
     ];
     let s = s.trim_start();
     if let Some(r) = s.strip_prefix("正午").or_else(|| s.strip_prefix("noon")) {
-        return Some((Clock::At(TimeOfDay { hour: 12, minute: 0, second: 0, precision: ClockPrecision::Minute }), r));
+        return Some((Clock::At(TimeOfDay { hour: 12, minute: 0, second: 0, millis: 0, precision: ClockPrecision::Minute }), r));
     }
     if let Some(r) = s.strip_prefix("midnight") {
-        return Some((Clock::At(TimeOfDay { hour: 24, minute: 0, second: 0, precision: ClockPrecision::Minute }), r));
+        return Some((Clock::At(TimeOfDay { hour: 24, minute: 0, second: 0, millis: 0, precision: ClockPrecision::Minute }), r));
     }
     PARTS.iter().find_map(|(w, p)| s.strip_prefix(w).map(|r| (Clock::Part(*p), r)))
 }
@@ -362,6 +370,7 @@ fn parse_clock(s: &str) -> Option<(Clock, &str)> {
         let mut hour = h as u32;
         let mut minute = 0;
         let mut second = 0;
+        let mut millis = 0;
         let mut precision = ClockPrecision::Hour;
         let mut rest = rest;
         let mut matched = false;
@@ -375,6 +384,16 @@ fn parse_clock(s: &str) -> Option<(Clock, &str)> {
                 second = sec as u32;
                 precision = ClockPrecision::Second;
                 rest = r;
+                // 小数秒（`18.982`）。4 桁目以降は切り捨てる。
+                if let Some(frac) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(',')) {
+                    let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        let ms: String = digits.chars().chain("000".chars()).take(3).collect();
+                        millis = ms.parse().unwrap_or(0);
+                        precision = ClockPrecision::Millisecond;
+                        rest = &frac[digits.len()..];
+                    }
+                }
             }
             matched = true;
         } else if let Some(r) = rest.strip_prefix('時') {
@@ -390,6 +409,11 @@ fn parse_clock(s: &str) -> Option<(Clock, &str)> {
                     precision = ClockPrecision::Minute;
                     rest = r;
                     if let Some((sec, r)) = take_number(rest) {
+                        // `12.5秒` の小数部は読み飛ばす（秒精度として扱う）。
+                        let r = match r.strip_prefix('.') {
+                            Some(f) => f.trim_start_matches(|c: char| c.is_ascii_digit()),
+                            None => r,
+                        };
                         if let Some(r) = r.strip_prefix('秒') {
                             second = sec as u32;
                             precision = ClockPrecision::Second;
@@ -424,7 +448,7 @@ fn parse_clock(s: &str) -> Option<(Clock, &str)> {
         if hour > 47 || minute > 59 || second > 60 {
             return None;
         }
-        return Some((Clock::At(TimeOfDay { hour, minute, second, precision }), rest));
+        return Some((Clock::At(TimeOfDay { hour, minute, second, millis, precision }), rest));
     }
     parse_part_of_day(s)
 }
@@ -525,6 +549,43 @@ fn parse_recurring(s: &str) -> Result<Option<TimeAst>> {
     };
     let (clock, _) = parse_trailing_clock(rest)?;
     Ok(Some(TimeAst::Recurring { rule, clock }))
+}
+
+/// 日本史の時代区分（おおよその西暦年の範囲 [開始, 終了)）。
+pub const JAPANESE_PERIODS: &[(&str, i64, i64)] = &[
+    ("安土桃山時代", 1568, 1600),
+    ("南北朝時代", 1336, 1392),
+    ("飛鳥時代", 592, 710),
+    ("奈良時代", 710, 794),
+    ("平安時代", 794, 1185),
+    ("鎌倉時代", 1185, 1333),
+    ("室町時代", 1336, 1573),
+    ("戦国時代", 1467, 1590),
+    ("江戸時代", 1603, 1868),
+    ("明治時代", 1868, 1912),
+    ("大正時代", 1912, 1926),
+    ("昭和時代", 1926, 1989),
+    ("平成時代", 1989, 2019),
+];
+
+/// `江戸時代` `江戸時代前期` `大正時代末期` → 年の区間。
+fn parse_period(s: &str) -> Option<TimeAst> {
+    let (name, a, b) = JAPANESE_PERIODS.iter().find(|(n, ..)| s.starts_with(n))?;
+    let rest = &s[name.len()..];
+    let len = (b - a) as f64;
+    let (fa, fb) = match rest {
+        "" => (0.0, 1.0),
+        "前期" => (0.0, 1.0 / 3.0),
+        "中期" => (1.0 / 3.0, 2.0 / 3.0),
+        "後期" => (2.0 / 3.0, 1.0),
+        "初期" | "初頭" => (0.0, 0.2),
+        "末期" | "末" => (0.8, 1.0),
+        _ => return None,
+    };
+    let y0 = a + (len * fa).floor() as i64;
+    let y1 = a + (len * fb).ceil() as i64 - 1;
+    let year = |y: i64| TimeAst::Date { date: DateSpec { year: Some(y), ..Default::default() } };
+    Some(TimeAst::Interval { start: Box::new(year(y0)), end: Box::new(year(y1.max(y0))) })
 }
 
 fn parse_decade_century(s: &str) -> Option<TimeAst> {
@@ -708,10 +769,15 @@ fn parse_date(input: &str) -> Result<DateSpec> {
             }
         }
     }
-    for pre in ["西暦", "ad ", "a.d. ", "紀元"] {
+    for pre in ["西暦", "グレゴリオ暦", "新暦", "ad ", "a.d. ", "紀元"] {
         if let Some(r) = s.strip_prefix(pre) {
             s = r.trim_start();
         }
+    }
+    let mut julian = false;
+    if let Some(r) = s.strip_prefix("ユリウス暦") {
+        julian = true;
+        s = r.trim_start();
     }
     let mut spec = if let Some(d) = try_iso(s)? {
         d
@@ -727,6 +793,7 @@ fn parse_date(input: &str) -> Result<DateSpec> {
             spec.year = Some(1 - y);
         }
     }
+    spec.julian = julian;
     spec.validate()?;
     Ok(spec)
 }
@@ -776,6 +843,9 @@ fn try_iso(s: &str) -> Result<Option<DateSpec>> {
     Ok(Some(spec))
 }
 
+/// 近代の元号と元年の西暦。
+const MODERN_ERAS: &[(&str, i64)] = &[("令和", 2019), ("平成", 1989), ("昭和", 1926), ("大正", 1912), ("明治", 1868)];
+
 /// 日本語表記（`2026年9月20日 15時30分`, `9月20日の夕方`, `2026年9月上旬`, `20日`）。
 fn try_japanese(s: &str) -> Result<Option<DateSpec>> {
     if !(s.contains('年') || s.contains('月') || s.contains('日')) {
@@ -783,28 +853,75 @@ fn try_japanese(s: &str) -> Result<Option<DateSpec>> {
     }
     let mut spec = DateSpec::default();
     let mut rest = s;
-    if let Some((n, r)) = take_number(rest) {
-        if let Some(r2) = r.strip_prefix('年') {
-            spec.year = Some(n);
-            rest = r2;
+    // 相対の年・月（`来月10日`, `昨年9月`, `来年3月1日`）。
+    const REL: &[(&str, Option<i32>, Option<i32>)] = &[
+        ("再来年", Some(2), None),
+        ("一昨年", Some(-2), None),
+        ("来年", Some(1), None),
+        ("昨年", Some(-1), None),
+        ("去年", Some(-1), None),
+        ("今年", Some(0), None),
+        ("再来月", None, Some(2)),
+        ("先々月", None, Some(-2)),
+        ("来月", None, Some(1)),
+        ("翌月", None, Some(1)),
+        ("先月", None, Some(-1)),
+        ("前月", None, Some(-1)),
+        ("今月", None, Some(0)),
+    ];
+    if let Some((w, yo, mo)) = REL.iter().find(|(w, ..)| rest.starts_with(w)) {
+        rest = rest[w.len()..].strip_prefix('の').unwrap_or(&rest[w.len()..]);
+        spec.year_offset = *yo;
+        spec.month_offset = *mo;
+        if rest.is_empty() {
+            return Ok(None);
         }
     }
-    if let Some((n, r)) = take_number(rest) {
-        if let Some(r2) = r.strip_prefix('月') {
-            spec.month = Some(n as u32);
-            rest = r2;
-            for (w, p) in [
-                ("上旬", MonthPart::Early),
-                ("初め", MonthPart::Early),
-                ("初旬", MonthPart::Early),
-                ("中旬", MonthPart::Mid),
-                ("下旬", MonthPart::Late),
-                ("末", MonthPart::Late),
-            ] {
-                if let Some(r3) = rest.strip_prefix(w) {
-                    spec.month_part = Some(p);
-                    rest = r3;
+    // 近代の元号（`昭和50年`, `平成元年`）。明治 5 年以前は旧暦（太陰太陽暦）なので月日は近似になる。
+    if let Some((era, start)) = MODERN_ERAS.iter().find(|(e, _)| rest.starts_with(e)) {
+        let r = &rest[era.len()..];
+        let (n, r) = match r.strip_prefix('元') {
+            Some(r) => (1, r),
+            None => take_number(r).ok_or_else(|| Error::Parse(format!("era year expected after `{era}`")))?,
+        };
+        rest = r.strip_prefix('年').ok_or_else(|| Error::Parse(format!("`年` expected after `{era}{n}`")))?;
+        spec.year = Some(start + n - 1);
+        spec.calendar_uncertain = *era == "明治" && n <= 5;
+    } else if spec.year_offset.is_none() && spec.month_offset.is_none() {
+        if let Some((n, r)) = take_number(rest) {
+            if let Some(r2) = r.strip_prefix('年') {
+                spec.year = Some(n);
+                rest = r2;
+            }
+        }
+    }
+    if spec.month_offset.is_none() {
+        if let Some((n, r)) = take_number(rest) {
+            if let Some(r2) = r.strip_prefix('月') {
+                spec.month = Some(n as u32);
+                rest = r2;
+                for (w, p) in [
+                    ("上旬", MonthPart::Early),
+                    ("初め", MonthPart::Early),
+                    ("初旬", MonthPart::Early),
+                    ("中旬", MonthPart::Mid),
+                    ("下旬", MonthPart::Late),
+                    ("末", MonthPart::Late),
+                ] {
+                    if let Some(r3) = rest.strip_prefix(w) {
+                        spec.month_part = Some(p);
+                        rest = r3;
+                    }
                 }
+            }
+        }
+    } else {
+        // `来月上旬` のように相対月の直後の区分。
+        for (w, p) in [("上旬", MonthPart::Early), ("初め", MonthPart::Early), ("中旬", MonthPart::Mid), ("下旬", MonthPart::Late), ("末", MonthPart::Late)]
+        {
+            if let Some(r3) = rest.strip_prefix(w) {
+                spec.month_part = Some(p);
+                rest = r3;
             }
         }
     }
@@ -812,17 +929,19 @@ fn try_japanese(s: &str) -> Result<Option<DateSpec>> {
         if let Some(r2) = r.strip_prefix('日') {
             spec.day = Some(n as u32);
             rest = r2;
-            // 「20日(日)」「20日（月）」の曜日注記は無視する。
+            // 「20日(日)」「20日（月）」「20日土曜日」の曜日注記は無視する。
             let t = rest.trim_start();
             if let Some(r3) = t.strip_prefix('(').or_else(|| t.strip_prefix('（')) {
                 if let Some(i) = r3.find([')', '）']) {
                     let close = r3[i..].chars().next().map(char::len_utf8).unwrap_or(1);
                     rest = &r3[i + close..];
                 }
+            } else if let Some((_, r3)) = take_weekday(t) {
+                rest = r3;
             }
         }
     }
-    if spec.year.is_none() && spec.month.is_none() && spec.day.is_none() {
+    if spec.year.is_none() && spec.month.is_none() && spec.day.is_none() && spec.month_part.is_none() {
         return Ok(None);
     }
     let (clock, tz) = parse_trailing_clock(rest)?;
@@ -908,6 +1027,72 @@ mod tests {
         assert!(matches!(p("9月上旬"), TimeAst::Date { date: DateSpec { month_part: Some(MonthPart::Early), .. } }));
         assert!(matches!(p("circa 1204"), TimeAst::Approx { .. }));
         assert!(matches!(p("２０２６年９月２０日"), TimeAst::Date { .. }));
+    }
+
+    #[test]
+    fn japanese_eras_weekdays_and_seconds() {
+        let date = |s: &str| match p(s) {
+            TimeAst::Date { date } => date,
+            TimeAst::Approx { inner } => match *inner {
+                TimeAst::Date { date } => date,
+                o => panic!("{o:?}"),
+            },
+            o => panic!("{s}: {o:?}"),
+        };
+        assert_eq!(date("昭和50年5月5日").year, Some(1975));
+        assert_eq!(date("平成元年6月1日").year, Some(1989));
+        assert_eq!(date("令和3年").year, Some(2021));
+        assert!(date("明治4年7月14日").calendar_uncertain, "lunisolar calendar before Meiji 6");
+        assert!(!date("明治6年1月1日").calendar_uncertain);
+        let d = date("2020年6月27日土曜日午前9:15頃");
+        assert_eq!((d.day, d.clock), (Some(27), Some(Clock::At(TimeOfDay { hour: 9, minute: 15, second: 0, millis: 0, precision: ClockPrecision::Minute }))));
+        assert!(matches!(date("2021年5月6日7時8分12.5秒").clock, Some(Clock::At(TimeOfDay { second: 12, .. }))));
+    }
+
+    #[test]
+    fn julian_dates_and_periods() {
+        let r = |s: &str| {
+            let e = TemporalExpression::strict(s, "gregorian").unwrap();
+            let cal = crate::time::calendar::CalendarFrame::gregorian();
+            crate::time::resolve::resolve(
+                &e,
+                &crate::time::resolve::ResolveContext { reference: None, calendar: &cal, lookup: &|_| crate::time::resolve::AnchorResult::NotFound },
+            )
+            .unwrap()
+            .range
+        };
+        // ユリウス暦 1200年6月1日 = グレゴリオ暦 1200年6月8日（この時期の差は 7 日）
+        assert_eq!(r("ユリウス暦1200年6月1日").earliest_start, crate::time::Tick::from_civil(1200, 6, 8, 0, 0, 0, 0));
+        assert_eq!(r("ユリウス暦1582年10月4日").earliest_start, crate::time::Tick::from_civil(1582, 10, 14, 0, 0, 0, 0));
+        assert_eq!(r("グレゴリオ暦1700年3月1日").earliest_start, crate::time::Tick::from_civil(1700, 3, 1, 0, 0, 0, 0));
+        let edo = r("江戸時代");
+        assert_eq!(
+            (edo.earliest_start, edo.latest_end),
+            (crate::time::Tick::from_civil(1603, 1, 1, 0, 0, 0, 0), crate::time::Tick::from_civil(1868, 1, 1, 0, 0, 0, 0))
+        );
+        let early = r("江戸時代前期");
+        assert_eq!(early.latest_end, crate::time::Tick::from_civil(1692, 1, 1, 0, 0, 0, 0));
+        assert!(parse_expression("江戸時代の人々").is_err());
+    }
+
+    #[test]
+    fn relative_year_and_month() {
+        match p("来月10日") {
+            TimeAst::Date { date } => assert_eq!((date.month_offset, date.day), (Some(1), Some(10))),
+            o => panic!("{o:?}"),
+        }
+        match p("昨年9月") {
+            TimeAst::Date { date } => assert_eq!((date.year_offset, date.month), (Some(-1), Some(9))),
+            o => panic!("{o:?}"),
+        }
+        assert!(matches!(p("来月上旬"), TimeAst::Date { date: DateSpec { month_offset: Some(1), month_part: Some(MonthPart::Early), .. } }));
+        match p("来月10日から12日まで") {
+            TimeAst::Interval { end, .. } => match *end {
+                TimeAst::Date { date } => assert_eq!((date.month_offset, date.day), (Some(1), Some(12))),
+                o => panic!("{o:?}"),
+            },
+            o => panic!("{o:?}"),
+        }
     }
 
     #[test]

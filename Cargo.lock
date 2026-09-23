@@ -254,12 +254,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronotope-extract"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chronotope-core",
+ "chronotope-engine",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "chronotope-server"
 version = "0.1.0"
 dependencies = [
  "axum",
  "chronotope-core",
  "chronotope-engine",
+ "chronotope-extract",
  "clap",
  "parking_lot",
  "serde",

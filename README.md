@@ -18,7 +18,8 @@ Canonical Graph を検索エンジンとしては使わず、検索は必ず Pro
 |---|---|
 | `crates/chronotope-core` | I/O を持たないドメインモデル。Resource / Assertion / Provenance / Identity / Revision / Work / Observation / Trajectory、時間モデル（パーサ・4 点境界・暦・Allen 代数・部分順序グラフ）、空間モデル（参照系・変換・距離）、ランキング方針、組み込み語彙 |
 | `crates/chronotope-engine` | Canonical ストア、Revision ログ（WAL）、Object Storage、crypto-shredding、Resolver / Materializer（無効化キュー）、Search Projection と索引（時間・空間・転置・全文・ベクトル）、Agent Query DSL、意味的書き込み API、RDF / SQL エクスポート |
-| `crates/chronotope-server` | CLI（`serve` / `bench` / `demo` / `query` / `export-sql` / `export-rdf`）と HTTP Agent API |
+| `crates/chronotope-extract` | テキストからの抽出パイプライン（抽出の中間形式、規則ベースの日本語抽出器、既存 Resource との照合、書き込み API への変換） |
+| `crates/chronotope-server` | CLI（`serve` / `bench` / `demo` / `query` / `ingest-text` / `export-sql` / `export-rdf`）と HTTP Agent API |
 | `sql/migrations` | PostgreSQL / Citus スキーマ（Expand → Migrate → Contract、RLS、分散キー設計） |
 
 ## 使い方
@@ -47,6 +48,7 @@ cargo run --release --bin chronotope -- bench --events 100000
 | GET | `/v1/freshness?branch=` | Projection の鮮度 |
 | GET | `/v1/export/rdf?branch=` | N-Triples（承認済み・再配布可能な主張のみ） |
 | POST | `/v1/materialize` | Materializer の即時実行 |
+| POST | `/v1/ingest/text` | テキストから主張を抽出して取り込む（`{"document": {...}, "extraction": {...}?, "dry_run": false}`） |
 
 主体はヘッダ `x-chronotope-principal` / `x-chronotope-kind`（`agent` / `human` / `crawler` / `sensor`）/
 `x-chronotope-groups` / `x-chronotope-curator` から作ります。認証は前段のゲートウェイで行う前提です
@@ -102,6 +104,58 @@ curl -s localhost:7878/v1/write -H 'content-type: application/json' -H 'x-chrono
 `decide_merge` / `accept_predicate` / `define_calendar` / `define_frame` / `define_license` / `set_rank_policy` /
 `shred_key`。
 
+## テキストからの取り込み
+
+記事などの非構造化テキストは、抽出の中間形式（`extract-v1`）を経由して取り込みます。エンジン自体は LLM を呼びません。
+
+```text
+文書（本文 + URL・公開日時・取得日時・ライセンス）
+  → 抽出（実体・主張・観測値。時間表現は原文のまま）
+  → 照合（既存 Resource へのリンク。一意に決まらなければ新規作成 + possibly_same_as）
+  → 書き込み（link_source → create_resource → propose_assertion / add_observation）
+```
+
+```bash
+cargo run --release --bin chronotope -- ingest-text --data ./data --url https://example.jp/news/1 --dry-run article.txt
+```
+
+- 抽出器は、組み込みの規則ベース抽出器（外部サービスを呼ばない）か、`--extraction` / `"extraction"` で渡した
+  任意の抽出器（人手・ローカル LLM など）の出力を使います。
+- 規則ベース抽出器は、KB 内の場所・組織・人物のラベルを辞書として使い、次のような書き方を拾います。文型に合わない書き方は取りこぼします。
+  - 出来事: `〇〇が開かれ` `〇〇が発生`、事典的な主題文 `〇〇（読み）は、…で行われた戦い` `〇〇とは、…に発生した地震である`
+  - 人物・組織: `〇〇氏` `〇〇大臣`、`主催した〇〇`
+  - 場所: 辞書の地名、`〇〇駅` `〇〇県〇〇市` `〇〇沖` `〇〇半島` など。続けて書かれた地名は KB 上の配下関係があるときだけ細かい方へ進み、
+    `〇〇で` `〇〇において` と場所を示す地名や `現在の〇〇` と書き添えられた地名を優先します
+  - 時間: 日付の途中の注記 `（昭和50年）` `（月曜日）` を読み飛ばし、`告示` より `執行` `発生` などが続く日付を優先します。
+    年の無い日付は見出しの年で補い、前近代の元号の月日（旧暦）は採らずに併記された西暦を使います
+  - 数値: `約1200人が参加`
+- 時間表現は原文のまま渡し、公開日時（無ければ本文冒頭の【日付】）を基準にエンジンが解決します。
+  `来月10日` を `10日` と取り違えるような、修飾を落とした部分一致は採りません。
+- すべての主張に、取得（本文のスナップショット）と抽出の記録（抽出器・モデル・スキーマ版・本文中の文字位置・確信度）が付き、
+  取り込み主体の権限どおり proposed から始まります。語彙に無い述語は提案（proposed）されます。
+
+中間形式の例:
+
+```json
+{
+  "extractor": { "name": "my-extractor", "model": "some-local-model", "model_version": "q4" },
+  "source_time": "2026-09-21",
+  "entities": [
+    { "ref": "E1", "types": ["Event"], "label": "東京駅の防災イベント" },
+    { "ref": "P1", "types": ["Station"], "label": "東京駅", "mention": "東京駅丸の内口の広場" }
+  ],
+  "claims": [
+    { "subject": "E1", "predicate": "occurred_at", "object": { "time": "20日午後3時半ごろ" }, "span": [12, 22], "confidence": 0.9 },
+    { "subject": "E1", "predicate": "took_place_at", "object": { "ref": "P1" }, "span": [23, 33] }
+  ],
+  "observations": [
+    { "target": "E1", "metric": "attendees", "value": 1200, "unit": "{person}", "approximate": true }
+  ]
+}
+```
+
+`span` は本文の文字（Unicode スカラー値）単位の `[start, end)` です。
+
 ## 仕様との対応
 
 | 仕様 | 実装 |
@@ -112,7 +166,7 @@ curl -s localhost:7878/v1/write -H 'content-type: application/json' -H 'x-chrono
 | 5 列と Assertion の境界 | ラベル・外部 ID・acquired_at・content_hash・内部 ID は列、意味情報は Assertion |
 | 6 Predicate と外部語彙 | `PredicateDef`（domain / range / inverse / transitive / symmetric / functional / status / role）と OWL-Time・PROV-O・CIDOC CRM・Wikidata・UCUM への Mapping。AI は `proposed` のみ |
 | 7 時間 3 層 | A: `TemporalExpression`（raw_text / AST / calendar_frame、解析失敗でも原文保存）、B: 4 点境界 `FuzzyRange`（i64 ms の UTA tick）、C: `TemporalOrderGraph`（順序ラベル、派生物） |
-| 7 対応表現 | `2026-09-20 15:30`、`2026年9月頃`、`9月1日〜9月10日`、`数日前`、`先週火曜日`、`月曜日の夕方`、`毎週金曜日25:30`（day_offset 付きで 01:30 へ解決）、`A事件の3日前`、`Aより後、Bより前`、`紀元前300年`、`1980年代`、`19世紀`、`9月上旬`、`circa 1204`、`3 days ago` など |
+| 7 対応表現 | `2026-09-20 15:30`、`2026年9月頃`、`9月1日〜9月10日`、`数日前`、`先週火曜日`、`月曜日の夕方`、`毎週金曜日25:30`（day_offset 付きで 01:30 へ解決）、`A事件の3日前`、`Aより後、Bより前`、`紀元前300年`、`1980年代`、`19世紀`、`9月上旬`、`circa 1204`、`3 days ago`、`来月10日から12日まで`、`昭和50年5月5日`・`平成元年`（近代の元号。明治 5 年以前は旧暦として幅を持たせる）、`ユリウス暦1200年6月1日`（グレゴリオ暦へ換算）、`江戸時代前期`（時代区分）、`3時半ごろ`（時刻の「ごろ」は ±30 分）など |
 | 8 時間関係 | Allen 13 関係のビットマスク・合成表・4 点境界からのあり得る関係（差分制約で厳密判定）。Pearce–Kelly の増分トポロジカル順序・循環検出。相対参照の深さ上限 8。変更 → 無効化キュー → 再計算 |
 | 9 時間の意味の分離 | event_time（occurred_at 等）/ valid_time / source_time / observed_at / acquired_at。`as_known_at` は acquired_at と状態変化の根拠時刻で判定 |
 | 10–11 Acquisition / Derivation | Source と Acquisition を分離（同 URL の再取得は別 Acquisition）。スナップショットは BLAKE3 の content-addressed Object Storage で自動重複排除。Derivation は抽出器・モデル・版・スキーマ版・スパン・確信度 |
@@ -162,6 +216,7 @@ Search Projection には行単位 RLS を掛けていません。RLS の securit
   スキーマと COPY 形式の一括エクスポートまでで、エンジンが直接読み書きするバックエンドはまだありません。
   Phase 0 の「Citus で 1000 万件」は未計測です（インメモリ 100 万件・単一 PostgreSQL 10 万件で計測）。
 - DuckDB / Parquet は境界（`TableStorage`、`ObservationStore`、`TrajectoryStorage::External`）のみで、読み出しは未実装です。
+- 組み込みの規則ベース抽出器は日本語の典型的な文型のみ対応です。精度が必要な場合は、同じ中間形式を出力する抽出器に置き換えてください。
 - 組み込みの Embedding は字句ベースの特徴ハッシュです。意味的な類似検索には外部モデルのベクトルを
   `set_embedding` で登録してください（空間ごとにモデル・版・次元を分離して保持します）。
 - ブランチの Projection は初回の `materialize_branch` で全件を計算します。時間順序グラフは関係の撤回時に全体を作り直します。

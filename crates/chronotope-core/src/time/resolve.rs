@@ -146,13 +146,13 @@ impl Resolver<'_, '_> {
             TimeAst::Date { date } => {
                 let reference = if date.year.is_none() { Some(self.reference()?) } else { self.ctx.reference };
                 let (s, e) = cal.date_bounds(date, reference).map_err(|e| Unresolved::new(UnresolvedKind::Unsupported, e.to_string()))?;
-                Ok((FuzzyRange::within(s, e), None))
+                let r = FuzzyRange::within(s, e);
+                // 旧暦の月日は新暦でおおむね 1 か月前後ずれるため、前後 45 日を可能範囲に含める。
+                Ok((if date.calendar_uncertain { r.widen(45 * super::TICKS_PER_DAY) } else { r }, None))
             }
             TimeAst::Approx { inner } => {
                 let (r, rec) = self.ast(inner)?;
-                // 「頃」は精度と同じ幅だけ前後に広げる（2026年9月頃 → 8月〜10月）。
-                let fuzz = r.width().unwrap_or(0);
-                Ok((r.widen(fuzz), rec))
+                Ok((r.widen(self.approx_fuzz(r.width())), rec))
             }
             TimeAst::Interval { start, end } => {
                 let s = match start.as_ref() {
@@ -254,6 +254,17 @@ impl Resolver<'_, '_> {
         }
     }
 
+    /// 「頃」で前後に広げる幅。
+    /// 日以上の精度では精度と同じ幅（2026年9月頃 → 8月〜10月、20日ごろ → 19〜21日）。
+    /// 時刻の「ごろ」は分単位の精度でも実際には数十分ずれるため、1 時間以下の精度は一律 ±30 分とする
+    /// （3時半ごろ → 3:00〜4:01）。いずれも暦の 1 日の長さに合わせて伸縮する。
+    fn approx_fuzz(&self, width: Option<i64>) -> i64 {
+        let Some(w) = width else { return 0 };
+        let tpd = self.cal().ticks_per_day().unwrap_or(super::TICKS_PER_DAY) as i128;
+        let hour = (super::TICKS_PER_HOUR as i128 * tpd / super::TICKS_PER_DAY as i128) as i64;
+        if w <= hour { hour / 2 } else { w }
+    }
+
     /// 暦の 1 日の長さに合わせた単位長。
     fn scaled_unit(&self, unit: Unit) -> Result<i64, Unresolved> {
         let tpd = self.cal().ticks_per_day().ok_or_else(|| self.unsupported("duration arithmetic"))?;
@@ -288,6 +299,22 @@ mod tests {
     }
 
     #[test]
+    fn approx_clock_is_widened_by_half_an_hour() {
+        let cal = CalendarFrame::gregorian_with_offset(540);
+        let reference = Some(Tick::from_civil(2026, 9, 21, 0, 0, 0, 540));
+        let r = res("20日午後3時半ごろ", reference, &cal, &none).unwrap();
+        assert_eq!(r.range.earliest_start, Tick::from_civil(2026, 9, 20, 15, 0, 0, 540));
+        assert_eq!(r.range.latest_end, Tick::from_civil(2026, 9, 20, 16, 1, 0, 540));
+        let r = res("2026-09-20 15時ごろ", None, &cal, &none).unwrap();
+        assert_eq!(r.range.earliest_start, Tick::from_civil(2026, 9, 20, 14, 30, 0, 540));
+        assert_eq!(r.range.latest_end, Tick::from_civil(2026, 9, 20, 16, 30, 0, 540));
+        // 日の精度は従来どおり前後 1 日。
+        let r = res("2026年9月20日ごろ", None, &cal, &none).unwrap();
+        assert_eq!(r.range.earliest_start, Tick::from_civil(2026, 9, 19, 0, 0, 0, 540));
+        assert_eq!(r.range.latest_end, Tick::from_civil(2026, 9, 22, 0, 0, 0, 540));
+    }
+
+    #[test]
     fn late_night_clock_rolls_over() {
         let cal = CalendarFrame::gregorian();
         let r = res("2026-09-18 25:30", None, &cal, &none).unwrap();
@@ -307,6 +334,20 @@ mod tests {
         assert_eq!(r.range.earliest_start, Tick::from_civil(2026, 9, 18, 0, 0, 0, 0));
         assert_eq!(r.range.latest_end, Tick::from_civil(2026, 9, 22, 0, 0, 0, 0));
         assert_eq!(res("数日前", None, &cal, &none).unwrap_err().kind, UnresolvedKind::NeedsReference);
+    }
+
+    #[test]
+    fn relative_month_resolves_from_reference() {
+        let cal = CalendarFrame::gregorian_with_offset(540);
+        let reference = Some(Tick::from_civil(2026, 9, 23, 0, 0, 0, 540));
+        let r = res("来月10日から12日まで", reference, &cal, &none).unwrap();
+        assert_eq!(r.range.earliest_start, Tick::from_civil(2026, 10, 10, 0, 0, 0, 540));
+        assert_eq!(r.range.latest_end, Tick::from_civil(2026, 10, 13, 0, 0, 0, 540));
+        let r = res("昨年12月", reference, &cal, &none).unwrap();
+        assert_eq!(r.range.earliest_start, Tick::from_civil(2025, 12, 1, 0, 0, 0, 540));
+        let r = res("来月10日", Some(Tick::from_civil(2026, 12, 5, 0, 0, 0, 540)), &cal, &none).unwrap();
+        assert_eq!(r.range.earliest_start, Tick::from_civil(2027, 1, 10, 0, 0, 0, 540), "crosses the year");
+        assert_eq!(res("来月10日", None, &cal, &none).unwrap_err().kind, UnresolvedKind::NeedsReference);
     }
 
     #[test]
