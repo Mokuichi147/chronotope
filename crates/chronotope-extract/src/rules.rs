@@ -12,7 +12,13 @@
 
 use crate::schema::*;
 use chronotope_core::ResourceId;
+use chronotope_core::model::LabelKind;
+use chronotope_core::time::Tick;
+use chronotope_core::time::calendar::CalendarFrame;
 use chronotope_core::time::expr::{TemporalExpression, TimeAst};
+use chronotope_core::time::resolve::{AnchorResult, ResolveContext, resolve};
+
+const TICKS_PER_DAY: i64 = chronotope_core::time::TICKS_PER_DAY;
 use chronotope_core::vocab::type_id;
 use chronotope_engine::KnowledgeBase;
 use chronotope_engine::text::normalize_label;
@@ -24,6 +30,7 @@ pub enum Kind {
     Place,
     Person,
     Organization,
+    Work,
 }
 
 impl Kind {
@@ -33,6 +40,7 @@ impl Kind {
             Kind::Place => "P",
             Kind::Person => "H",
             Kind::Organization => "O",
+            Kind::Work => "W",
         }
     }
 }
@@ -42,12 +50,16 @@ pub struct GazEntry {
     pub id: ResourceId,
     pub label: String,
     pub kind: Kind,
+    /// 優先ラベルとして一致した（別名・旧称だけの一致ではない）。
+    pub preferred: bool,
 }
 
 /// KB のラベルから作る辞書。
 #[derive(Debug, Default)]
 pub struct Gazetteer {
     by_norm: HashMap<String, Vec<GazEntry>>,
+    /// 行政区画の字を省いた呼び方（`海辺市` → `海辺`、`山川国` → `山川`）。ラベルと重ならないものだけ。
+    stems: HashMap<String, Vec<GazEntry>>,
     max_len: usize,
     /// 場所の親（located_in / inside / contains）。同名の別地域へのリンクを避けるのに使う。
     parents: HashMap<ResourceId, Vec<ResourceId>>,
@@ -75,6 +87,17 @@ impl Gazetteer {
                 continue;
             };
             let label = r.label(Some("ja")).unwrap_or_default().to_string();
+            if kind == Kind::Place {
+                // 別名（旧称など）からは作らない（旧称 `大海市` から `大海` を作るような誤りを避ける）
+                for l in r.labels.iter().filter(|l| l.kind == LabelKind::Preferred && l.lang.as_deref().is_none_or(|x| x == "ja")) {
+                    if let Some(stem) = l.text.strip_suffix(['市', '町', '村', '国']).filter(|x| stem_ok(x)) {
+                        let v = g.stems.entry(normalize_label(stem)).or_default();
+                        if !v.iter().any(|e| e.id == r.id) {
+                            v.push(GazEntry { id: r.id, label: label.clone(), kind, preferred: false });
+                        }
+                    }
+                }
+            }
             for l in &r.labels {
                 let n = normalize_label(&l.text);
                 let len = n.chars().count();
@@ -83,11 +106,15 @@ impl Gazetteer {
                 }
                 g.max_len = g.max_len.max(len);
                 let v = g.by_norm.entry(n).or_default();
-                if !v.iter().any(|e| e.id == r.id) {
-                    v.push(GazEntry { id: r.id, label: label.clone(), kind });
+                let preferred = l.kind == LabelKind::Preferred;
+                match v.iter_mut().find(|e| e.id == r.id) {
+                    Some(e) => e.preferred |= preferred,
+                    None => v.push(GazEntry { id: r.id, label: label.clone(), kind, preferred }),
                 }
             }
         }
+        let by_norm = &g.by_norm;
+        g.stems.retain(|k, _| !by_norm.contains_key(k));
         for key in ["located_in", "inside", "contains"] {
             let Some(pid) = s.predicate_by_key.get(key) else { continue };
             for aid in s.by_predicate.get(pid).into_iter().flatten() {
@@ -120,15 +147,41 @@ impl Gazetteer {
         false
     }
 
-    /// 位置 `i` から始まる最長一致（長さ, 候補）。
-    fn longest_at(&self, chars: &[char], i: usize) -> Option<(usize, &[GazEntry])> {
+    pub fn has_label(&self, label: &str) -> bool {
+        self.by_norm.contains_key(&normalize_label(label))
+    }
+
+    /// 位置 `i` から始まる最長一致（長さ, 候補）。優先ラベルで一致する候補があれば、別名だけの一致
+    /// （旧称が他の自治体の名前と同じ場合など）は除く。
+    /// 省略形（[`Gazetteer::stems`]）での一致なら 3 つ目が `true`。
+    fn longest_at(&self, chars: &[char], i: usize) -> Option<(usize, Vec<&GazEntry>, bool)> {
         let max = self.max_len.min(chars.len() - i);
         (2..=max).rev().find_map(|len| {
-            let sub: String = chars[i..i + len].iter().collect();
-            self.by_norm.get(&normalize_label(&sub)).map(|v| (len, v.as_slice()))
+            if chars[i].is_whitespace() || chars[i + len - 1].is_whitespace() {
+                return None;
+            }
+            let key = normalize_label(&chars[i..i + len].iter().collect::<String>());
+            if let Some(v) = self.by_norm.get(&key) {
+                let preferred: Vec<&GazEntry> = v.iter().filter(|e| e.preferred).collect();
+                return Some((len, if preferred.is_empty() { v.iter().collect() } else { preferred }, false));
+            }
+            self.stems.get(&key).map(|v| (len, v.iter().collect(), true))
         })
     }
 }
+
+/// 省略形として辞書に入れてよいか（漢字・片仮名 2 字以上で、元号・時代名と重ならない）。
+fn stem_ok(stem: &str) -> bool {
+    stem.chars().count() >= 2
+        && stem.chars().all(is_name_char)
+        && !MODERN_ERA_NAMES.contains(&stem)
+        && !chronotope_core::time::parse::JAPANESE_PERIODS.iter().any(|(p, ..)| p.strip_suffix("時代") == Some(stem))
+}
+
+/// 省略形の地名の直後に続いてよい語（`海辺近傍` `海辺間`）。助詞・記号が続く場合も可。
+const STEM_FOLLOW: &[&str] = &["近傍", "付近", "周辺", "近郊", "一帯", "方面", "城下", "市街", "地区", "間"];
+/// 省略形の地名がこれに続く場合は出来事の名前の一部（`海辺の戦い`）とみなす。
+const STEM_EVENT: &[&str] = &["の戦", "の乱", "の変", "の陣", "の役"];
 
 // ------------------------------------------------------------------ 文字種
 
@@ -345,8 +398,9 @@ pub fn find_times(chars: &[char], from: usize, to: usize) -> Vec<(usize, usize, 
     let mut k = from;
     while k < to {
         let c = chars[k];
-        if matches!(c, '（' | '(') && k > from && is_time_char(chars[k - 1]) {
-            if let Some(close) = (k + 1..to.min(k + 16)).find(|&x| matches!(chars[x], '）' | ')')) {
+        // 注記の括弧（`1991年〈平成3年〉4月8日` の山括弧も含む）
+        if matches!(c, '（' | '(' | '〈') && k > from && is_time_char(chars[k - 1]) {
+            if let Some(close) = (k + 1..to.min(k + 16)).find(|&x| matches!(chars[x], '）' | ')' | '〉')) {
                 let inner = text(chars, k + 1, close);
                 match era_year(&inner) {
                     // `1945年（昭和20年）8月15日`: 近代の元号の注記は読み飛ばす。
@@ -554,6 +608,15 @@ fn bad_start(chars: &[char], s: usize) -> bool {
     "年回第号代".contains(chars[s]) || (s > 0 && is_digit(chars[s - 1]))
 }
 
+/// 報道の見出しから、角括弧の見出し語（`【速報】` `【山川県】`）と末尾の出典表記を除く。
+fn headline(title: &str) -> String {
+    let mut t = title.trim();
+    while let Some(rest) = t.strip_prefix('【').and_then(|r| r.split_once('】')).map(|(_, r)| r.trim_start()) {
+        t = rest;
+    }
+    t.trim().to_string()
+}
+
 /// 見出し中の 4 桁の西暦年（`2020年〇〇市議会議員選挙` → 2020）。
 fn title_year(label: &str) -> Option<i64> {
     let chars: Vec<char> = label.chars().collect();
@@ -579,8 +642,26 @@ fn time_salience(chars: &[char], end: usize) -> i32 {
 fn sentences(chars: &[char]) -> Vec<(usize, usize)> {
     let mut out = vec![];
     let mut s = 0;
+    // 括弧・鉤括弧の中（`『走れ!丸石』` `（まるいし!）`）の感嘆符・疑問符では区切らない
+    let mut depth = 0i32;
     for (i, c) in chars.iter().enumerate() {
-        if matches!(c, '。' | '！' | '？' | '!' | '?' | '\n') {
+        match c {
+            '『' | '「' | '（' | '(' | '〈' | '《' | '“' => depth += 1,
+            '』' | '」' | '）' | ')' | '〉' | '》' | '”' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        // 題名の中の句点（`『海辺、その後。』`）でも区切らない
+        let quoted = depth > 0 && chars[s..i].iter().rev().find(|c| matches!(c, '『' | '「' | '“' | '（' | '(')).is_some_and(|c| matches!(c, '『' | '「' | '“'));
+        let end = match c {
+            '\n' => true,
+            '。' => !quoted,
+            '！' | '？' | '!' | '?' => depth == 0,
+            _ => false,
+        };
+        if end {
+            if c == &'\n' {
+                depth = 0;
+            }
             if i + 1 > s {
                 out.push((s, i + 1));
             }
@@ -639,7 +720,7 @@ const PERSON_SUFFIXES: &[&str] =
     &["委員長", "容疑者", "被告", "選手", "監督", "大臣", "知事", "市長", "町長", "村長", "区長", "首相", "議員", "社長", "会長", "教授", "代表", "さん", "氏"];
 const NOT_NAME: &[&str] = &["担当", "政府", "省", "庁", "委員", "協会", "会社", "部", "課", "局", "本部", "事務", "同", "元", "前", "新"];
 /// 人名の末尾に来ない字（`山川県知事` の `山川県` などを人名にしない）。
-const NOT_NAME_END: &[char] = &['県', '市', '町', '村', '府', '都', '区', '国', '郡', '党', '軍', '家', '氏'];
+const NOT_NAME_END: &[char] = &['県', '市', '町', '村', '府', '都', '区', '国', '郡', '党', '軍', '家', '氏', '院'];
 const EVENT_TRIGGERS: &[&str] =
     &["が開かれ", "が開催", "が行われ", "が発生", "が起き", "が起こ", "が実施", "が始ま", "が開幕", "が閉幕", "を開催", "を開い", "を実施"];
 /// `〇〇があり` は一般的すぎるので、出来事らしい名詞のときだけ出来事とする。
@@ -672,7 +753,12 @@ const EVENT_NOUN_SUFFIXES: &[&str] = &[
 /// 行政区画の接尾辞（分割の境目。`京都府京都市` を `京都` で切らないよう府・県を先に見る）。
 const PREFECTURE_SUFFIXES: &[char] = &['県', '府', '都'];
 /// 場所の候補に含まれていたら組織・施設名の一部とみなして場所にしない語。
-const NOT_PLACE: &[&str] = &["警察", "警備", "鉄道", "会社", "協会", "大学", "学校", "本部", "組合", "銀行", "委員会", "政府", "旅客"];
+/// 地名の直後に続くと、組織・言語・通貨などの名前の一部になる語（`山川新聞` `山川銀行` `山川人` `山川語`）。
+const ORG_AFTER: &[&str] = &[
+    "新聞", "経済新聞", "日報", "新報", "放送", "テレビ", "銀行", "大学", "高校", "高等学校", "中学", "小学校", "プロ野球", "リーグ", "シリーズ", "代表",
+    "航空", "鉄道", "電力", "ガス", "人", "語", "円", "ドル", "選手", "協会", "連盟", "球団", "ハム",
+];
+const NOT_PLACE: &[&str] = &["警察", "警備", "鉄道", "会社", "協会", "大学", "学校", "本部", "組合", "銀行", "委員会", "政府", "旅客", "選挙区"];
 const PARTICIPATION: &[&str] = &["参加", "出席", "姿を見せ", "訪れ", "登壇", "出演", "視察", "来場"];
 const PLACE_SUFFIXES: &[(&str, &str)] = &[
     ("スタジアム", "Place"),
@@ -685,6 +771,7 @@ const PLACE_SUFFIXES: &[(&str, &str)] = &[
     ("球場", "Place"),
     ("会場", "Place"),
     ("駅", "Station"),
+    ("停留場", "Station"),
     ("港", "TransportFacility"),
     ("県", "Region"),
     ("市", "City"),
@@ -762,8 +849,9 @@ impl Builder {
                     reference: r.clone(),
                     types: types.iter().map(|t| t.to_string()).collect(),
                     label: label.to_string(),
-                    mention: Some(text(chars, s, e)),
-                    span: Some([s, e]),
+                    // 本文に現れない名前（報道の見出し）は位置を持たない
+                    mention: (s < e).then(|| text(chars, s, e)),
+                    span: (s < e).then_some([s, e]),
                     description,
                     resource,
                 });
@@ -779,6 +867,7 @@ impl Builder {
 /// 主題文の出来事らしい名詞の末尾。
 const TOPIC_EVENT_SUFFIXES: &[&str] = &[
     "戦い",
+    "の戦",
     "合戦",
     "の乱",
     "の役",
@@ -790,6 +879,10 @@ const TOPIC_EVENT_SUFFIXES: &[&str] = &[
     "攻防戦",
     "海戦",
     "戦争",
+    "大戦",
+    "抗争",
+    "戦役",
+    "作戦",
     "紛争",
     "一揆",
     "騒動",
@@ -818,7 +911,6 @@ const TOPIC_EVENT_SUFFIXES: &[&str] = &[
     "高潮",
     "竜巻",
     "土石流",
-    "山崩れ",
     "崩落",
     "沈没",
     "転覆",
@@ -835,36 +927,214 @@ const TOPIC_EVENT_SUFFIXES: &[&str] = &[
     "襲撃",
     "焼失",
     "決壊",
+    "遭難",
+    "法難",
+    "崩れ",
+    "低気圧",
 ];
 /// 主題文が出来事を述べていることを示す語。
 const TOPIC_EVENT_CUES: &[&str] =
-    &["発生", "行われ", "行なわ", "執行", "起き", "起こ", "墜落", "衝突", "勃発", "開催", "開かれ", "投票", "続いた", "襲った", "見舞われ"];
+    &["発生", "行われ", "行なわ", "執行", "起き", "起こ", "墜落", "衝突", "勃発", "開催", "開かれ", "投票", "続いた", "襲った", "襲撃", "見舞われ"];
 
-/// 冒頭の主題（`〇〇（読み）は、` `〇〇とは、`）が出来事なら (ラベル, 主題の終端, 本文の開始)。
-fn topic_event(chars: &[char], sents: &[(usize, usize)]) -> Option<(String, usize, usize)> {
+/// 冒頭の主題（`〇〇（読み）は、` `〇〇とは、` `『〇〇』は、`）。
+struct TopicHead {
+    label: String,
+    /// 主題の終端（読みの括弧を含む）と本文の開始
+    end: usize,
+    body: usize,
+    /// 読みの括弧の中（`（やまだ たろう、1950年1月1日 - ）` の内側）
+    paren: Option<(usize, usize)>,
+    /// `『〇〇』` と書かれた題名
+    quoted: bool,
+}
+
+fn topic_head(chars: &[char], sents: &[(usize, usize)]) -> Option<TopicHead> {
     let (_, first_end) = *sents.first()?;
-    let limit = first_end.min(120);
+    let limit = first_end.min(160);
     let head: String = chars[..limit].iter().collect();
-    let (pos, marker) = ["とは、", "とは", "は、", "は,"].iter().filter_map(|m| head.find(m).map(|p| (p, *m))).min_by_key(|(p, _)| *p)?;
-    let topic_str = &head[..pos];
+    // `〇〇（読み）は戦国時代の…` のように、読みの括弧の直後なら読点の無い `は` `では` も主題の区切りとする
+    let (pos, marker) = ["とは、", "とは", "は、", "は,", "）は", "）では", ")は", "』は"]
+        .iter()
+        .filter_map(|m| head.find(m).map(|p| (p, *m)))
+        .map(|(p, m)| match m.strip_prefix(['）', ')', '』']) {
+            Some(rest) => (p + m.len() - rest.len(), rest),
+            None => (p, m),
+        })
+        // `〇〇選挙は2019年…` のように、出来事を表す語の直後の `は`
+        .chain(TOPIC_EVENT_SUFFIXES.iter().filter_map(|s| head.find(&format!("{s}は")).map(|p| (p + s.len(), "は"))))
+        // `〇〇は2001年7月1日に公開された…` のように、日付が直後に続く `は`
+        .chain(head.char_indices().find(|(i, c)| *c == 'は' && head[i + c.len_utf8()..].starts_with(|d: char| d.is_ascii_digit())).map(|(i, _)| (i, "は")))
+        .min_by_key(|(p, _)| *p)?;
+    let topic_str = head[..pos].trim_end();
     // 読み仮名などの括弧を除く
-    let label: String = match topic_str.find(['（', '(']) {
-        Some(p) => topic_str[..p].to_string(),
-        None => topic_str.to_string(),
+    let (label, paren) = match topic_str.find(['（', '(']) {
+        Some(p) => {
+            let open = topic_str[..p].chars().count();
+            let close = topic_str.chars().count().saturating_sub(1);
+            (topic_str[..p].to_string(), (close > open + 1 && matches!(chars[close], '）' | ')')).then_some((open + 1, close)))
+        }
+        None => (topic_str.to_string(), None),
     };
-    let label = label.trim().to_string();
+    let label = label.trim();
+    let quoted = label.starts_with('『') && label.ends_with('』');
+    let label = label.trim_start_matches('『').trim_end_matches('』').trim().to_string();
     let n = label.chars().count();
-    if !(2..=40).contains(&n) || label.contains(['、', '。']) {
-        return None;
-    }
-    let sentence: String = chars[..first_end].iter().collect();
-    let is_event = TOPIC_EVENT_SUFFIXES.iter().any(|s| label.ends_with(s)) || TOPIC_EVENT_CUES.iter().any(|c| sentence.contains(c));
-    if !is_event {
+    // 鉤括弧の題名は読点を含んでよい（`『おかえり、海辺』`）
+    if !(1..=60).contains(&n) || (!quoted && (!(2..=40).contains(&n) || label.contains(['、', '。']))) {
         return None;
     }
     let topic_end = topic_str.chars().count();
-    let body = topic_end + marker.chars().count();
-    Some((label, n.min(topic_end), body))
+    Some(TopicHead { label, end: topic_end, body: topic_end + marker.chars().count(), paren, quoted })
+}
+
+/// 冒頭の主題が出来事なら (ラベル, 主題の終端, 本文の開始)。
+fn topic_event(chars: &[char], sents: &[(usize, usize)]) -> Option<(String, usize, usize)> {
+    let h = topic_head(chars, sents)?;
+    let sentence: String = chars[..sents[0].1].iter().collect();
+    // 述語の名詞（`…丸石戦争の第二の合戦である。` `…描かれた架空の戦争。`）が出来事を表す場合も出来事とする
+    let predicate = sentence.trim_end_matches(['。', '.']);
+    let predicate = ["である", "だ", "のこと", "の名称", "の総称"].iter().fold(predicate, |p, w| p.strip_suffix(w).unwrap_or(p));
+    let is_event = TOPIC_EVENT_SUFFIXES.iter().any(|s| h.label.ends_with(s) || predicate.ends_with(s)) || TOPIC_EVENT_CUES.iter().any(|c| sentence.contains(c));
+    is_event.then(|| (h.label.clone(), h.label.chars().count().min(h.end), h.body))
+}
+
+/// 出来事以外の主題の種類。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Subject {
+    /// 読みの括弧に生年月日（`（やまだ たろう、1950年1月1日 - ）`）がある人物
+    Person,
+    /// 公開・発売などが書かれた作品（`『〇〇』は、1954年に公開された日本映画`）
+    Work(&'static str),
+    /// 所在が書かれた施設（`〇〇駅（〇〇えき）は、山川県海辺市にある…駅`）
+    Facility(&'static str),
+}
+
+/// 作品の公開・発売などを表す語（日付の直後に続く）。
+const RELEASE_CUES: &[&str] = &["公開", "発売", "放送", "放映", "刊行", "発行", "初演", "封切", "配信", "上映", "配給"];
+/// 作品の種類を表す語（`2001年の日本映画` `1985年製作の作品`）。
+const WORK_NOUNS: &[&str] = &["映画", "作品", "ドラマ", "アニメ", "ビデオ", "シネマ"];
+/// 施設の所在を表す語。
+const LOCATED_CUES: &[&str] = &["にある", "にあった", "に位置する", "に所在する", "に存在した", "に設置されて", "に置かれ", "に建つ"];
+/// 生没年の区切り。
+const LIFE_DASH: &[char] = &['-', '－', '–', '—', '〜', '～', '―'];
+
+fn topic_subject(chars: &[char], sents: &[(usize, usize)], h: &TopicHead) -> Option<Subject> {
+    let (_, first_end) = sents[0];
+    let body = text(chars, h.body.min(first_end), first_end);
+    // `『〇〇大戦争』` のように鉤括弧で書かれた題名は、出来事らしい語で終わっても作品とする
+    if !h.quoted && TOPIC_EVENT_SUFFIXES.iter().any(|s| h.label.ends_with(s)) {
+        return None;
+    }
+    if let Some((a, z)) = h.paren {
+        if life_span(chars, a, z).is_some() {
+            return Some(Subject::Person);
+        }
+    }
+    let times = find_times(chars, h.body.min(first_end), first_end);
+    let released = times.iter().any(|(_, e, _)| release_follows(chars, *e));
+    let made = WORK_NOUNS.iter().any(|w| body.contains(w)) && times.iter().any(|(_, e, _)| made_follows(chars, *e));
+    if h.quoted || released || made {
+        let ty = if body.contains("映画") {
+            "Movie"
+        } else if body.contains("ゲーム") {
+            "Game"
+        } else if ["小説", "漫画", "書籍", "絵本"].iter().any(|w| body.contains(w)) {
+            "Book"
+        } else {
+            "Work"
+        };
+        return Some(Subject::Work(ty));
+    }
+    if LOCATED_CUES.iter().any(|c| body.contains(c)) {
+        if let Some((_, ty)) = PLACE_SUFFIXES.iter().find(|(suf, _)| h.label.ends_with(suf) && h.label.chars().count() > suf.chars().count()) {
+            return Some(Subject::Facility(ty));
+        }
+    }
+    None
+}
+
+/// 本文中の時間表現（開始位置, 終了位置, 原文）。
+type TimeSpan = (usize, usize, String);
+
+/// 読みの括弧の中の生没年月日（`1950年1月1日 - 2020年2月2日` `1950年1月1日 - `）。
+/// 範囲として一続きに読まれた場合も、区切りの前後に分ける。
+fn life_span(chars: &[char], a: usize, z: usize) -> Option<(TimeSpan, Option<TimeSpan>)> {
+    let times = find_times(chars, a, z);
+    let (s, e, raw) = times.first()?.clone();
+    // 時間の抽出は `1950年1月1日 - 2020年2月2日` を `…から…` に整える
+    let split = raw.find(LIFE_DASH).map(|k| (k, raw[k..].chars().next().map_or(1, char::len_utf8))).or_else(|| raw.find("から").map(|k| (k, "から".len())));
+    if let Some((k, n)) = split {
+        let (l, r) = (raw[..k].trim(), raw[k + n..].trim());
+        if !valid_time(l) {
+            return None;
+        }
+        let birth = (s, s + l.chars().count(), l.to_string());
+        let death = (!r.is_empty() && valid_time(r)).then(|| (e - r.chars().count(), e, r.to_string()));
+        return Some((birth, death));
+    }
+    // 区切りが日付の後に続く（`1950年1月1日 - ）`）
+    if !chars[e..z].iter().find(|c| !c.is_whitespace()).is_some_and(|c| LIFE_DASH.contains(c)) {
+        return None;
+    }
+    let death = times.into_iter().nth(1);
+    Some(((s, e, raw), death))
+}
+
+/// 時間表現が指す区間（UTA tick の開始・終了）。相対表現は `reference` を基準にする。
+fn resolve_range(raw: &str, reference: Option<Tick>, calendar: &CalendarFrame) -> Option<(i64, i64)> {
+    let expr = TemporalExpression::parse(raw, &calendar.key);
+    let ctx = ResolveContext { reference, calendar, lookup: &|_| AnchorResult::NotFound };
+    let r = resolve(&expr, &ctx).ok()?;
+    Some((r.range.earliest_start.0, r.range.latest_end.0))
+}
+
+/// 報道の日付が記事の日付に近いとみなす日数。
+const NEWS_WINDOW_DAYS: i64 = 14;
+
+/// 報道の本文の日付のうち、記事の日付に最も近いもの（先の日付は 3 倍遠いとみなす）と、その距離（日）。
+fn news_time(times: &[(usize, usize, String)], reference: Option<Tick>, calendar: &CalendarFrame) -> Option<(TimeSpan, i64)> {
+    let r = reference?.0;
+    let day = crate::rules::TICKS_PER_DAY;
+    times
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let (a, z) = resolve_range(&t.2, Some(Tick(r)), calendar)?;
+            let dist = if z < r {
+                r - z
+            } else if a > r + day {
+                (a - r - day).saturating_mul(3)
+            } else {
+                0
+            };
+            Some(((dist / day, i), t))
+        })
+        .min_by_key(|(k, _)| *k)
+        .map(|((d, _), t)| (t.clone(), d))
+}
+
+/// 日付に続く句（読点・句点まで。注記の括弧は読み飛ばす）。
+fn clause_after(chars: &[char], e: usize) -> String {
+    let mut k = e;
+    if matches!(chars.get(k), Some('（' | '(' | '〈')) {
+        if let Some(c) = (k + 1..chars.len().min(k + 16)).find(|&x| matches!(chars[x], '）' | ')' | '〉')) {
+            k = c + 1;
+        }
+    }
+    let end = (k..chars.len().min(k + 30)).find(|&x| matches!(chars[x], '、' | '。' | '，')).unwrap_or(chars.len().min(k + 30));
+    text(chars, k, end)
+}
+
+/// 日付に続く句に公開・発売などが書かれているか（`2001年7月1日に山川映画の配給で公開された`）。
+fn release_follows(chars: &[char], e: usize) -> bool {
+    let clause = clause_after(chars, e);
+    RELEASE_CUES.iter().any(|c| clause.contains(c))
+}
+
+/// 日付に続く句に制作・製作や作品の種類が書かれているか（`1985年製作の映画` `1990年に制作された` `2001年の山川・海辺の合作映画`）。
+fn made_follows(chars: &[char], e: usize) -> bool {
+    let clause = clause_after(chars, e);
+    clause.contains("制作") || clause.contains("製作") || (clause.starts_with('の') && WORK_NOUNS.iter().any(|w| clause.contains(w)))
 }
 
 pub struct RuleExtractor {
@@ -880,6 +1150,105 @@ impl RuleExtractor {
 
     pub fn from_kb(kb: &KnowledgeBase) -> Self {
         Self::new(Gazetteer::from_kb(kb))
+    }
+
+    /// 人物・作品・施設の主題の実体と、その生没年月日・出生地・公開日・所在の主張。
+    fn subject_claims(&self, chars: &[char], sents: &[(usize, usize)], h: &TopicHead, subject: Subject, b: &mut Builder) -> Vec<ClaimMention> {
+        let label_end = h.label.chars().count().min(h.end);
+        let (kind, ty) = match subject {
+            Subject::Person => (Kind::Person, "Person"),
+            Subject::Work(ty) => (Kind::Work, ty),
+            Subject::Facility(ty) => (Kind::Place, ty),
+        };
+        // 接尾辞などで既に地名として拾った主題（`〇〇駅`）はその実体を使う
+        let existing = b.mentions.iter().find(|m| m.kind == kind && m.start == 0 && m.end == label_end).map(|m| m.reference.clone());
+        let me = match existing {
+            Some(r) => {
+                if let Some(e) = b.entities.iter_mut().find(|e| e.reference == r) {
+                    e.types = vec![ty.to_string()];
+                }
+                r
+            }
+            None => b.add(kind, &[ty], &h.label, chars, 0, label_end, None, None),
+        };
+        let (_, first_end) = sents[0];
+        let time_claim = |pred: &str, (s, e, raw): (usize, usize, String)| ClaimMention {
+            subject: me.clone(),
+            predicate: pred.into(),
+            object: ObjectMention::Time { time: raw, calendar: None },
+            span: Some([s, e]),
+            confidence: Some(0.8),
+        };
+        let mut claims = vec![];
+        // 位置 `p` の直前（読点・句点を挟まない）に書かれた地名のうち、最も細かい既存の地名。無ければ最後の地名。
+        let place_before = |p: usize, b: &Builder| -> Option<String> {
+            let near: Vec<&Mention> = b
+                .mentions
+                .iter()
+                .filter(|m| m.kind == Kind::Place && m.reference != me && m.end <= p && m.start + 30 >= p)
+                .filter(|m| !chars[m.end..p].iter().any(|c| "、。，．,.".contains(*c)))
+                .collect();
+            let res = |m: &Mention| b.entities.iter().find(|e| e.reference == m.reference).and_then(|e| e.resource.as_deref()?.parse::<ResourceId>().ok());
+            let linked: Vec<(&Mention, ResourceId)> = near.iter().filter_map(|m| Some((*m, res(m)?))).collect();
+            // 前から順に、直前に採った地名の配下にあるものだけ細かい方へ進む（`山川県海辺市浜辺町` の `浜辺町` が別の市の町なら海辺市）
+            let mut sorted = linked.clone();
+            sorted.sort_by_key(|(m, _)| m.start);
+            let mut cur: Option<(&Mention, ResourceId)> = None;
+            for (m, r) in sorted {
+                match cur {
+                    Some((_, cr)) if !self.gazetteer.within(r, cr) => {}
+                    _ => cur = Some((m, r)),
+                }
+            }
+            cur.map(|(m, _)| m.reference.clone()).or_else(|| near.last().map(|m| m.reference.clone()))
+        };
+        let place_claim = |pred: &str, r: String, p: usize| ClaimMention {
+            subject: me.clone(),
+            predicate: pred.into(),
+            object: ObjectMention::Ref { reference: r },
+            span: Some([p, p]),
+            confidence: Some(0.7),
+        };
+        match subject {
+            Subject::Person => {
+                if let Some((birth, death)) = h.paren.and_then(|(a, z)| life_span(chars, a, z)) {
+                    claims.push(time_claim("birth_date", birth));
+                    if let Some(d) = death {
+                        claims.push(time_claim("death_date", d));
+                    }
+                }
+                // `山川県海辺市出身` `海辺市生まれ`（段落の最初の 2 文まで）
+                // 出身地（育った土地のこともある）より出生地（`生まれ`）を優先する
+                let scope = sents.get(3).map_or(chars.len(), |s| s.1);
+                let first = |ws: &[&str]| ws.iter().filter_map(|w| find(chars, w, h.body).filter(|p| *p < scope)).min();
+                let cue = first(&["生まれ", "で生まれ", "に生まれ", "で誕生"]).or_else(|| first(&["出身"]));
+                if let Some(p) = cue {
+                    let p = if chars[..p].ends_with(&['で']) || chars[..p].ends_with(&['に']) { p - 1 } else { p };
+                    if let Some(r) = place_before(p, b) {
+                        claims.push(place_claim("birth_place", r, p));
+                    }
+                }
+            }
+            Subject::Work(_) => {
+                // 公開・発売などが続く日付（段落の最初の 3 文まで）。無ければ `2009年の日本映画` `2013年制作` の年。
+                let scope = sents.get(2).map_or(chars.len(), |s| s.1);
+                let times = find_times(chars, h.body.min(first_end), scope);
+                let released = times.iter().find(|(_, e, _)| release_follows(chars, *e)).cloned();
+                let made = || times.iter().filter(|(s, ..)| *s < first_end).find(|(_, e, _)| made_follows(chars, *e));
+                if let Some(t) = released.or_else(|| made().cloned()) {
+                    claims.push(time_claim("publication_date", t));
+                }
+            }
+            Subject::Facility(_) => {
+                let cue = LOCATED_CUES.iter().filter_map(|w| find(chars, w, h.body).filter(|p| *p < first_end)).min();
+                if let Some(p) = cue {
+                    if let Some(r) = place_before(p, b) {
+                        claims.push(place_claim("located_in", r, p));
+                    }
+                }
+            }
+        }
+        claims
     }
 
     pub fn extract(&self, doc: &Document) -> Extraction {
@@ -913,8 +1282,12 @@ impl RuleExtractor {
                 let s = run_before(&chars, p, is_name_char);
                 let name = text(&chars, s, p);
                 let len = p - s;
+                // `山川県海辺市長浜` の `山川県海辺` + `市長`、`海辺市長` の `海辺`（既知の市の長）は人名ではない。
+                let office_of_place = suf.chars().next().is_some_and(|c| "市町村区".contains(c) && self.gazetteer.has_label(&format!("{name}{c}")));
                 if !(2..=6).contains(&len)
                     || NOT_NAME.iter().any(|w| name.contains(w))
+                    || name.contains(['県', '府', '都'])
+                    || office_of_place
                     || name.contains("議会")
                     || name.ends_with(NOT_NAME_END)
                     || bad_start(&chars, s)
@@ -928,18 +1301,44 @@ impl RuleExtractor {
         }
 
         // 3. 辞書（KB の既存ラベル）による最長一致
-        // 語の途中（`新湾岸国際空港` の `湾岸`）や、直後に行政区画の字が続く位置（`浜辺町` の `浜辺`）では採らない。
+        // 語の途中（`新湾岸国際空港` の `湾岸`）、直後に行政区画の字が続く位置（`浜辺町` の `浜辺`）、
+        // 長い町村名の末尾（`丸石浜辺町` の `浜辺町`）では採らない。`湾岸都中町` の `湾岸都` のように、
+        // 行政区画の字で終わる一致の後に次の地名が続くのは構わない。
         let admin_end = |c: char| "県府都道市区町村郡国".contains(c);
         let inside_word = |s: usize, e: usize| {
-            let prev_word = s > 0 && is_name_char(chars[s - 1]) && !admin_end(chars[s - 1]) && chars[s - 1] != '現';
+            let ends_admin = admin_end(chars[e - 1]);
+            // `現・湾岸都中町` `山川・谷原県` の `・` は区切りとみなす（`丸石・浜辺地区` の `浜辺` は語の途中）
+            let prev_word = s > 0
+                && is_name_char(chars[s - 1])
+                && !admin_end(chars[s - 1])
+                && !"現旧".contains(chars[s - 1])
+                && !(chars[s - 1] == '・' && ends_admin);
             let next_word = e < chars.len() && is_name_char(chars[e]);
-            let next_admin = e < chars.len() && admin_end(chars[e]);
-            (prev_word && next_word) || next_admin
+            let next_admin = e < chars.len() && admin_end(chars[e]) && !ends_admin;
+            // 英字・片仮名の名前は語の途中（`Seaside` の `side`、`マリンバ` の `マリ`）で採らない
+            let same_script = |a: char, b: char| (a.is_ascii_alphanumeric() && b.is_ascii_alphanumeric()) || (is_katakana(a) && is_katakana(b) && b != '・' && a != '・');
+            let script_inside = (s > 0 && same_script(chars[s], chars[s - 1])) || (e < chars.len() && same_script(chars[e - 1], chars[e]));
+            // `湾岸時間` `東部夏時間` のような時間帯
+            let followed_by = |ws: &[&str]| ws.iter().any(|w| text(&chars, e, (e + w.chars().count()).min(chars.len())) == *w);
+            let time_zone = followed_by(&["時間", "標準時", "夏時間"]);
+            // 組織・言語・通貨などの名前の一部（`山川新聞` `山川人` `山川円`）
+            let org_name = followed_by(ORG_AFTER);
+            // 都道府県名は前後に語が続いても採る（`第9回大会山川県大会` の `山川県`）
+            let prefecture = "都道府県".contains(chars[e - 1]);
+            (prev_word && next_word && !prefecture) || next_admin || (prev_word && "町村".contains(chars[e - 1])) || script_inside || time_zone || org_name
         };
+        let mut ambiguous: Vec<(String, Vec<(ResourceId, String)>)> = vec![];
         let mut i = 0;
         while i < chars.len() {
+            // 省略形（`海辺市` を `海辺` と書く）は、助詞・記号か `近傍` `間` などが続く場合だけ採る。
+            let starts_with = |e: usize, w: &str| text(&chars, e, (e + w.chars().count()).min(chars.len())) == w;
+            let stem_alone = |s: usize, e: usize| {
+                let prev_ok = s == 0 || !is_name_char(chars[s - 1]) || admin_end(chars[s - 1]) || "現旧・".contains(chars[s - 1]);
+                let next_ok = e >= chars.len() || !is_name_char(chars[e]) || STEM_FOLLOW.iter().any(|w| starts_with(e, w));
+                prev_ok && next_ok && !STEM_EVENT.iter().any(|w| starts_with(e, w))
+            };
             match self.gazetteer.longest_at(&chars, i) {
-                Some((len, entries)) if !b.overlaps(i, i + len) && !inside_word(i, i + len) => {
+                Some((len, entries, stem)) if !b.overlaps(i, i + len) && !inside_word(i, i + len) && (!stem || stem_alone(i, i + len)) => {
                     let kind = entries[0].kind;
                     // 同名の候補が入れ子（`京都` → 京都府 ⊃ 京都市）なら、どちらを指しても誤りにならない外側を採る。
                     let outermost = entries.iter().find(|o| entries.iter().all(|e| e.id == o.id || self.gazetteer.within(e.id, o.id)));
@@ -953,10 +1352,30 @@ impl RuleExtractor {
                         Kind::Organization => &["Organization"],
                         _ => &["Person"],
                     };
-                    b.add(kind, types, &label, &chars, i, i + len, None, resource);
+                    let r = b.add(kind, types, &label, &chars, i, i + len, None, resource);
+                    if outermost.is_none() && kind == Kind::Place {
+                        ambiguous.push((r, entries.iter().map(|e| (e.id, e.label.clone())).collect()));
+                    }
                     i += len;
                 }
                 _ => i += 1,
+            }
+        }
+        // 同名の地名（別の都市にもある `中央区` など）は、同じ文書で一意に決まった地名の配下にある候補が
+        // 1 つだけならそれを採る。
+        let known: Vec<ResourceId> = b
+            .mentions
+            .iter()
+            .filter(|m| m.kind == Kind::Place)
+            .filter_map(|m| b.entities.iter().find(|e| e.reference == m.reference)?.resource.as_deref()?.parse().ok())
+            .collect();
+        for (r, cands) in &ambiguous {
+            let inside: Vec<&(ResourceId, String)> = cands.iter().filter(|(c, _)| known.iter().any(|k| k != c && self.gazetteer.within(*c, *k))).collect();
+            if let [(c, label)] = inside.as_slice() {
+                if let Some(e) = b.entities.iter_mut().find(|e| &e.reference == r) {
+                    e.resource = Some(c.to_string());
+                    e.label = label.clone();
+                }
             }
         }
 
@@ -1004,7 +1423,15 @@ impl RuleExtractor {
                 let i = i + skip;
                 // `室町時代` `江戸幕府` の `室町` `江戸`、`三代目市兵衛` の `三代目市` などは地名ではない。
                 let after = text(&chars, k, (k + 2).min(chars.len()));
+                // 片仮名語の途中（`丸石ホールディングス` の `丸石ホール`）や、首長の職名（`海辺市長` の `海辺市`）で終わるものも地名ではない
+                let in_word = k < chars.len() && is_katakana(chars[k - 1]) && is_katakana(chars[k]) && chars[k] != '・';
+                let office = k < chars.len() && chars[k] == '長' && "市町村区".contains(chars[k - 1]);
+                // `同市` `同県` は前の地名を指す（後で照応を解く）
+                let anaphor = cand.starts_with('同') && cand.chars().count() == 2;
                 let not_place = NOT_PLACE.iter().any(|w| cand.contains(w))
+                    || anaphor
+                    || in_word
+                    || office
                     || ["時代", "幕府", "政権", "様式"].iter().any(|w| after.starts_with(w))
                     || cand.contains("代目")
                     || cand.starts_with(|c: char| "一二三四五六七八九十".contains(c))
@@ -1016,9 +1443,16 @@ impl RuleExtractor {
                     let split = if cand.starts_with("北海道") && cc.len() > 4 {
                         Some(3)
                     } else {
+                        // 都府県の名前として無理のない長さのときだけ分ける（`丸石田園都市線` を `丸石田園都` にしない）
                         PREFECTURE_SUFFIXES.iter().find_map(|suf| {
                             let pos = cc.iter().position(|c| c == suf)?;
-                            (pos >= 1 && pos + 2 < cc.len()).then_some(pos + 1)
+                            let outer: String = cc[..=pos].iter().collect();
+                            let plausible = match suf {
+                                '都' => outer == "東京都",
+                                '府' => outer == "京都府" || outer == "大阪府",
+                                _ => (2..=3).contains(&pos),
+                            };
+                            (plausible && pos + 2 < cc.len()).then_some(pos + 1)
                         })
                     };
                     match split {
@@ -1036,6 +1470,26 @@ impl RuleExtractor {
                 }
             }
             i = e;
+        }
+
+        // `同市` `同県` `同国` は、それより前の最も近い同じ種類の地名を指す
+        for p in find_all(&chars, "同") {
+            let Some(&c) = chars.get(p + 1) else { continue };
+            if !"市県町村区国".contains(c) || b.overlaps(p, p + 2) || chars.get(p + 2).is_some_and(|x| is_kanji(*x) && !"内外".contains(*x)) {
+                continue;
+            }
+            let ante = b
+                .mentions
+                .iter()
+                .filter(|m| m.kind == Kind::Place && m.end <= p)
+                .filter_map(|m| b.entities.iter().find(|e| e.reference == m.reference).map(|e| (m.end, e)))
+                .filter(|(_, e)| e.label.ends_with(c))
+                .max_by_key(|(end, _)| *end)
+                .map(|(_, e)| (e.label.clone(), e.types.clone(), e.resource.clone()));
+            if let Some((label, types, resource)) = ante {
+                let types: Vec<&str> = types.iter().map(String::as_str).collect();
+                b.add(Kind::Place, &types, &label, &chars, p, p + 2, None, resource);
+            }
         }
 
         // 同じ文の場所のうち、出来事の場所には最も具体的なもの（分割した外側の県などは除く）を使う。
@@ -1102,14 +1556,61 @@ impl RuleExtractor {
                     }
                     m = (*next).clone();
                 }
+                // 辞書に無い場所は、括弧で添えられた既存の地名の配下として記録する。
+                // `丸石空港（山川県海辺市）` → 括弧内の最も細かい既存の地名、`海辺市（丸石島）` → 括弧の直前の地名。
+                if resource_of(entities, &m.reference).is_none() && !sub.iter().any(|(c, _)| *c == m.reference) {
+                    let open = |c: Option<&char>| matches!(c, Some('（' | '('));
+                    let mut parent = None;
+                    if open(chars.get(m.end)) {
+                        let mut p = m.end + 1;
+                        if let Some(w) = ["現在の", "現・", "現：", "現:", "現"].iter().find(|w| text(&chars, p, (p + w.chars().count()).min(chars.len())) == **w) {
+                            p += w.chars().count();
+                        }
+                        let mut n = cands.iter().copied().find(|n| n.start == p);
+                        while let Some(x) = n {
+                            if resource_of(entities, &x.reference).is_some() {
+                                parent = Some(x.reference.clone());
+                            }
+                            n = next_in_chain(x.end);
+                        }
+                    }
+                    if parent.is_none() && m.start > 0 && open(chars.get(m.start - 1)) {
+                        if let Some(before) = cands.iter().copied().find(|n| n.end + 1 == m.start) {
+                            parent = if resource_of(entities, &before.reference).is_some() {
+                                Some(before.reference.clone())
+                            } else {
+                                // 直前の地名が辞書に無い（`海辺市の丸石空港（丸石港）`）なら、その連なりの既存の地名
+                                let mut best = None;
+                                let mut n = cands.iter().copied().filter(|n| n.end <= before.start).max_by_key(|n| n.end);
+                                while let Some(x) = n.filter(|x| chain_end(x) >= before.start) {
+                                    if resource_of(entities, &x.reference).is_some() {
+                                        best = Some(x.reference.clone());
+                                    }
+                                    n = cands.iter().copied().filter(|n| n.end <= x.start).max_by_key(|n| n.end);
+                                }
+                                best
+                            };
+                        }
+                    }
+                    if let Some(p) = parent.filter(|p| *p != m.reference) {
+                        sub.push((m.reference.clone(), p));
+                    }
+                }
                 Some((m, sub))
             };
 
         // 5. 出来事
         // (参照, 位置, 時間・場所を探し始める位置)
         let mut events: Vec<(String, usize, usize)> = vec![];
-        // 5a. 主題文（`〇〇（読み）は、…で行われた戦い` `〇〇とは、…発生した地震である`）
-        let topic = topic_event(&chars, &sents);
+        // 5a. 主題文（`〇〇（読み）は、…で行われた戦い` `〇〇とは、…発生した地震である`）。
+        // 人物・作品・施設の主題（生年月日・公開日・所在が書かれたもの）なら出来事にはしない。
+        let head = topic_head(&chars, &sents);
+        let subject = head.as_ref().and_then(|h| topic_subject(&chars, &sents, h));
+        let mut subject_claims = vec![];
+        if let (Some(h), Some(subject)) = (&head, subject) {
+            subject_claims = self.subject_claims(&chars, &sents, h, subject, &mut b);
+        }
+        let topic = if subject.is_some() { None } else { topic_event(&chars, &sents) };
         let has_topic = topic.is_some();
         if let Some((label, end, body)) = topic {
             let r = b.add(Kind::Event, &["Event"], &label, &chars, 0, end, None, None);
@@ -1136,6 +1637,17 @@ impl RuleExtractor {
         }
         ev_marks.sort();
         ev_marks.dedup();
+        // 5c. 報道（見出しの日付か公開日時がある文書）では、本文の最初の文を主な出来事の文とする。
+        // その文に文型の出来事が無ければ、見出しを主な出来事にする。
+        let news_doc = !has_topic && (header_time.is_some() || doc.published.is_some());
+        let lead = sents.iter().position(|&(a, z)| z > header_end && text(&chars, a.max(header_end), z).trim().chars().count() > 5).filter(|_| news_doc);
+        if let Some(li) = lead.filter(|li| !ev_marks.iter().any(|(s, _)| sent_of(*s) == *li)) {
+            if let Some(title) = doc.title.as_deref().map(headline).filter(|t| (2..=80).contains(&t.chars().count())) {
+                let start = sents[li].0.max(header_end);
+                let r = b.add(Kind::Event, &["Event"], &title, &chars, start, start, None, None);
+                events.push((r, start, start));
+            }
+        }
         for (s, p) in ev_marks {
             let noun = text(&chars, s, p);
             let si = sent_of(s);
@@ -1160,7 +1672,7 @@ impl RuleExtractor {
         }
 
         // 6. 主張
-        let mut claims = vec![];
+        let mut claims = subject_claims;
         for (inner, outer, s, e) in &place_parents {
             claims.push(ClaimMention {
                 subject: inner.clone(),
@@ -1170,6 +1682,12 @@ impl RuleExtractor {
                 confidence: Some(0.8),
             });
         }
+        let calendar = CalendarFrame::builtin(&doc.calendar()).unwrap_or_else(CalendarFrame::gregorian);
+        let news_reference = doc
+            .published
+            .as_deref()
+            .and_then(|p| Tick::parse_iso(p).ok())
+            .or_else(|| header_time.as_deref().and_then(|h| resolve_range(h, None, &calendar)).map(|(a, _)| Tick(a)));
         let nearest_event = |pos: usize| -> Option<String> {
             events.iter().filter(|(_, s, _)| *s <= pos).max_by_key(|(_, s, _)| *s).or(events.first()).map(|(r, ..)| r.clone())
         };
@@ -1185,6 +1703,22 @@ impl RuleExtractor {
             };
             let body_from = (*body).max(ss).max(header_end);
             let mut chosen = best(find_times(&chars, body_from, se)).map(|t| (t, 0.8));
+            // 報道の最初の文の出来事は、その文の日付のうち記事の日付に最も近いもの
+            // （`先月3日に始まった工事について…9日発表` の `9日`）。先の予定の日付は後回しにする。
+            let is_news_lead = lead == Some(si);
+            if is_news_lead {
+                if let Some((t, dist)) = news_time(&find_times(&chars, body_from, se), news_reference, &calendar) {
+                    chosen = Some((t, 0.8));
+                    // 最初の文の日付が記事の日付から離れている（背景の出来事や先の予定）なら、
+                    // 続く 2 文にある記事の日付に近い日付（`…12日に発表した`）を使う。
+                    if dist > NEWS_WINDOW_DAYS {
+                        let later: Vec<_> = sents.iter().skip(si + 1).take(2).flat_map(|&(a, z)| find_times(&chars, a, z)).collect();
+                        if let Some((t2, _)) = news_time(&later, news_reference, &calendar).filter(|(_, d)| *d <= NEWS_WINDOW_DAYS) {
+                            chosen = Some((t2, 0.6));
+                        }
+                    }
+                }
+            }
             // 主題文の日付が出来事の日付らしくない（`…の辞職に伴い執行`）なら、
             // 後続の文で出来事らしい語が続く日付（`〇月〇日投開票`）を優先する。
             if is_topic && chosen.as_ref().is_some_and(|((_, e, _), _)| time_salience(&chars, *e) < 0) {
@@ -1213,9 +1747,20 @@ impl RuleExtractor {
                 let scope_end = if is_topic { chars.len() } else { se };
                 chosen = find_periods(&chars, ss, scope_end).into_iter().next().map(|t| (t, 0.4));
             }
+            // 報道の最初の文に日付が無ければ、記事の日付までに起きたこととする（`2020年5月10日以前`）。
+            // 予定・見通しを伝える記事（`…へ` `…する予定`）は先のことなので付けない。
+            if chosen.is_none() && is_news_lead {
+                let lead_text = text(&chars, ss, se);
+                let future = ["予定", "見通し", "方針", "見込み"].iter().any(|w| lead_text.contains(w)) || doc.title.as_deref().is_some_and(|t| t.trim_end().ends_with('へ'));
+                let dated = header_time.clone().map(|h| (h, 0, header_end)).or_else(|| doc.published.as_deref().and_then(|p| p.get(..10)).map(|d| (d.to_string(), 0, 0)));
+                if let (false, Some((d, a, z))) = (future, dated) {
+                    chosen = Some(((a, z, format!("{d}以前")), 0.4));
+                }
+            }
             if let Some(((ts, te, mut raw), conf)) = chosen {
                 // 年の無い日付は見出しの年で補う（`2019年〇〇選挙は、…4月7日に投票` → `2019年4月7日`）。
-                if TemporalExpression::strict(&raw, "gregorian").is_ok_and(|e| lacks_year(&e.ast)) {
+                // 報道の見出しの年は記事の日付とは限らないので、報道では本文の日付（公開日時が基準）のままにする。
+                if !news_doc && TemporalExpression::strict(&raw, "gregorian").is_ok_and(|e| lacks_year(&e.ast)) {
                     if let Some(y) = title_year(&label) {
                         raw = format!("{y}年{raw}");
                     }
@@ -1229,11 +1774,16 @@ impl RuleExtractor {
                 });
             }
             // 主題文に場所が無ければ、段落の後続の文から探す（`…地震である。震源は山川県沖。`）。
+            // 報道の最初の文の出来事も、その文に場所が無ければ続く 2 文から探す（`…が開催される。会場は山川県の丸石ホール。`）。
             let place = place_in(&b.mentions, &b.entities, si, *s, *body).or_else(|| {
-                if !is_topic {
+                let until = if is_topic {
+                    sents.len()
+                } else if is_news_lead {
+                    (si + 3).min(sents.len())
+                } else {
                     return None;
-                }
-                (si + 1..sents.len()).find_map(|sj| place_in(&b.mentions, &b.entities, sj, sents[sj].0, sents[sj].0))
+                };
+                (si + 1..until).find_map(|sj| place_in(&b.mentions, &b.entities, sj, sents[sj].0, sents[sj].0))
             });
             if let Some((m, sub)) = place {
                 claims.push(ClaimMention {
@@ -1340,30 +1890,38 @@ mod tests {
     }
 
     /// 架空の地名だけの KB。`本町` は別の府にある同名の町、`湾岸` `浜辺` は語の途中に現れる別名。
-    fn gazetteer_kb() -> (KnowledgeBase, HashMap<&'static str, String>) {
+    /// 地名（ラベル, 型, 別名）と配下関係（子, 親）から KB を作る。同じラベルの地名は `ラベル#2` のように区別する。
+    fn kb_with(places: &[(&'static str, &str, Vec<&str>)], parents: &[(&str, &str)]) -> (KnowledgeBase, HashMap<&'static str, String>) {
         use chronotope_core::model::Principal;
         let mut kb = KnowledgeBase::in_memory(chronotope_engine::KbConfig::default());
         let mut ids = HashMap::new();
         let w = |kb: &mut KnowledgeBase, body: serde_json::Value| kb.write(&Principal::curator("t"), serde_json::from_value(body).unwrap()).unwrap();
-        for (key, types, aliases) in [
-            ("山川県", "Region", vec![]),
-            ("海辺市", "City", vec![]),
-            ("谷原府", "Region", vec![]),
-            ("本町", "City", vec![]),
-            ("湾岸都", "Region", vec!["湾岸"]),
-            ("浜辺市", "City", vec!["浜辺"]),
-        ] {
-            let r =
-                w(&mut kb, serde_json::json!({ "op": "create_resource", "resource": { "types": [types], "label": key, "lang": "ja", "aliases": aliases } }));
-            ids.insert(key, r["id"].as_str().unwrap().to_string());
+        for (key, types, aliases) in places {
+            let label = key.split('#').next().unwrap();
+            let r = w(&mut kb, serde_json::json!({ "op": "create_resource", "resource": { "types": [types], "label": label, "lang": "ja", "aliases": aliases } }));
+            ids.insert(*key, r["id"].as_str().unwrap().to_string());
         }
-        for (c, p) in [("海辺市", "山川県"), ("本町", "谷原府")] {
+        for (c, p) in parents {
             w(
                 &mut kb,
                 serde_json::json!({ "op": "propose_assertion", "subject": ids[c], "predicate": "located_in", "object": { "resource": ids[p] }, "status": "accepted" }),
             );
         }
         (kb, ids)
+    }
+
+    fn gazetteer_kb() -> (KnowledgeBase, HashMap<&'static str, String>) {
+        kb_with(
+            &[
+                ("山川県", "Region", vec![]),
+                ("海辺市", "City", vec![]),
+                ("谷原府", "Region", vec![]),
+                ("本町", "City", vec![]),
+                ("湾岸都", "Region", vec!["湾岸"]),
+                ("浜辺市", "City", vec!["浜辺"]),
+            ],
+            &[("海辺市", "山川県"), ("本町", "谷原府")],
+        )
     }
 
     fn doc(t: &str) -> Document {
@@ -1513,5 +2071,229 @@ mod tests {
         assert_eq!(x.observations.len(), 1);
         assert_eq!(x.observations[0].value, 1200.0);
         assert!(x.observations[0].approximate);
+    }
+
+    fn places(x: &Extraction) -> Vec<(String, Option<String>)> {
+        x.entities.iter().filter(|e| e.types != ["Event"]).map(|e| (e.label.clone(), e.resource.clone())).collect()
+    }
+
+    #[test]
+    fn prefers_preferred_labels_and_document_context() {
+        let (kb, ids) = kb_with(
+            &[
+                ("山川県", "Region", vec![]),
+                ("谷原県", "Region", vec![]),
+                ("海辺市", "City", vec![]),
+                // 旧称として別の市の名前を持つ
+                ("丸石市", "City", vec!["海辺市"]),
+                ("中町", "City", vec![]),
+                ("中町#2", "City", vec![]),
+            ],
+            &[("中町", "山川県"), ("中町#2", "谷原県")],
+        );
+        let x = RuleExtractor::from_kb(&kb);
+        let p = place_of(&x.extract(&doc("2020年5月1日、海辺市で火災があった。")));
+        assert_eq!(p.resource.as_deref(), Some(ids["海辺市"].as_str()), "an alias does not compete with a preferred label");
+        // 同名の `中町` は、同じ文書の `山川県` の配下にある方
+        let p = place_of(&x.extract(&doc("山川県の事件。2020年5月1日、中町で火災があった。")));
+        assert_eq!(p.resource.as_deref(), Some(ids["中町"].as_str()));
+        let p = place_of(&x.extract(&doc("2020年5月1日、中町で火災があった。")));
+        assert_eq!(p.resource, None, "without context the homonym stays unresolved");
+    }
+
+    #[test]
+    fn place_names_without_their_suffix() {
+        let (kb, ids) = kb_with(&[("海辺市", "City", vec![]), ("浜辺町", "City", vec![])], &[]);
+        let x = RuleExtractor::from_kb(&kb);
+        let p = place_of(&x.extract(&doc("2020年5月1日、海辺近傍で火災があった。")));
+        assert_eq!((p.label.as_str(), p.resource.as_deref()), ("海辺市", Some(ids["海辺市"].as_str())));
+        for t in ["2020年5月1日、丸海辺で火災があった。", "2020年5月1日、海辺の戦いがあった。", "2020年5月1日、海辺時代の遺跡で火災があった。"] {
+            assert!(places(&x.extract(&doc(t))).iter().all(|(_, r)| r.as_deref() != Some(ids["海辺市"].as_str())), "{t}");
+        }
+        // 長い町名の末尾（`丸石浜辺町` の `浜辺町`）は既存の町にしない
+        let got = places(&x.extract(&doc("2020年5月1日、丸石浜辺町で火災があった。")));
+        assert!(got.iter().all(|(_, r)| r.as_deref() != Some(ids["浜辺町"].as_str())), "{got:?}");
+    }
+
+    #[test]
+    fn mayor_suffix_after_a_place_is_not_a_person() {
+        let (kb, _) = gazetteer_kb();
+        let x = RuleExtractor::from_kb(&kb).extract(&doc("2020年5月1日、山川県海辺市長浜付近で地震があった。"));
+        assert!(x.entities.iter().all(|e| e.types != ["Person"]), "{:?}", x.entities);
+        assert_eq!(place_of(&x).label, "海辺市");
+    }
+
+    #[test]
+    fn parenthesized_places_become_parents() {
+        let (kb, ids) = gazetteer_kb();
+        let rx = RuleExtractor::from_kb(&kb);
+        // 括弧内の地名に `で` などが続く場合はそちらを出来事の場所とするので、ここでは続かない書き方にする
+        for t in ["丸石号事故は、2020年5月1日に丸石空港（山川県海辺市）に着陸しようとした機体の事故である。", "2020年5月1日、現・山川県海辺市の丸石空港で事故が起きた。"] {
+            let x = rx.extract(&doc(t));
+            let p = place_of(&x);
+            assert_eq!(p.label, "丸石空港", "{t}");
+            let parent = x.claims.iter().find(|c| c.predicate == "located_in" && c.subject == p.reference).expect(t);
+            let ObjectMention::Ref { reference } = &parent.object else { panic!() };
+            let e = x.entities.iter().find(|e| &e.reference == reference).unwrap();
+            assert_eq!(e.resource.as_deref(), Some(ids["海辺市"].as_str()), "{t}");
+        }
+    }
+
+    #[test]
+    fn topic_sentences_without_a_comma() {
+        let x = RuleExtractor::new(Gazetteer::default());
+        for (t, label, time) in [
+            ("丸石峠の戦い（まるいしとうげのたたかい）は戦国時代の1560年5月1日に行われた合戦。", "丸石峠の戦い", "1560年5月1日"),
+            ("2020年海辺市長選挙は2020年4月5日に執行された海辺市の市長選挙である。", "2020年海辺市長選挙", "2020年4月5日"),
+            ("丸石原の戦（まるいしはら の いくさ）とは、1530年7月6日に起きた戦。", "丸石原の戦", "1530年7月6日"),
+            ("丸石屋遭難（まるいしやそうなん）は、1866年3月9日に宿泊客が襲撃された事件。", "丸石屋遭難", "1866年3月9日"),
+        ] {
+            let x = x.extract(&doc(t));
+            let ev = x.entities.iter().find(|e| e.types == ["Event"]).unwrap_or_else(|| panic!("{t}"));
+            assert_eq!(ev.label, label);
+            let occ = x.claims.iter().find(|c| c.subject == ev.reference && c.predicate == "occurred_at").unwrap_or_else(|| panic!("{t}"));
+            assert!(matches!(&occ.object, ObjectMention::Time { time: tt, .. } if tt == time), "{t}: {:?}", occ.object);
+        }
+    }
+
+    fn claim<'a>(x: &'a Extraction, subject: &str, pred: &str) -> Option<&'a ObjectMention> {
+        x.claims.iter().find(|c| c.subject == subject && c.predicate == pred).map(|c| &c.object)
+    }
+
+    fn time_of(o: Option<&ObjectMention>) -> Option<String> {
+        match o {
+            Some(ObjectMention::Time { time, .. }) => Some(time.clone()),
+            _ => None,
+        }
+    }
+
+    fn label_of(x: &Extraction, o: Option<&ObjectMention>) -> Option<String> {
+        match o {
+            Some(ObjectMention::Ref { reference }) => x.entities.iter().find(|e| &e.reference == reference).map(|e| e.label.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn news_headline_is_the_main_event() {
+        let (kb, _) = gazetteer_kb();
+        let rx = RuleExtractor::from_kb(&kb);
+        let d: Document = serde_json::from_value(serde_json::json!({
+            "title": "【速報】丸石祭の来場者が過去最多に",
+            "text": "【2020年5月10日】 先月3日に始まった改修工事が終わり、9日、丸石祭が開かれた。7月20日には次回の日程も発表される。会場は山川県海辺市の丸石公園。"
+        }))
+        .unwrap();
+        let x = rx.extract(&d);
+        // 最初の文に文型の出来事（`丸石祭が開かれ`）があればそれを使う
+        let ev = x.entities.iter().find(|e| e.types == ["Event"]).unwrap();
+        assert_eq!(ev.label, "丸石祭");
+        // 記事の日付に最も近い日付（背景の `先月3日` や先の `7月20日` ではない）
+        assert_eq!(time_of(claim(&x, &ev.reference, "occurred_at")).as_deref(), Some("9日"));
+        // 最初の文に場所が無ければ続く文から
+        assert_eq!(label_of(&x, claim(&x, &ev.reference, "took_place_at")).as_deref(), Some("丸石公園"));
+
+        // 文型の出来事が無ければ見出し（角括弧の見出し語を除く）を主な出来事にする
+        let d: Document = serde_json::from_value(serde_json::json!({
+            "title": "【山川県】丸石祭が中止に",
+            "published": "2020-05-10T09:00:00+09:00",
+            "text": "山川県海辺市は9日、丸石祭の中止を発表した。"
+        }))
+        .unwrap();
+        let x = rx.extract(&d);
+        let ev = x.entities.iter().find(|e| e.types == ["Event"]).unwrap();
+        assert_eq!(ev.label, "丸石祭が中止に");
+        assert_eq!(time_of(claim(&x, &ev.reference, "occurred_at")).as_deref(), Some("9日"));
+        assert_eq!(label_of(&x, claim(&x, &ev.reference, "took_place_at")).as_deref(), Some("海辺市"));
+    }
+
+    #[test]
+    fn person_work_and_facility_topics() {
+        let (kb, _) = gazetteer_kb();
+        let rx = RuleExtractor::from_kb(&kb);
+        let x = rx.extract(&doc("山田 花子（やまだ はなこ、1950年〈昭和25年〉1月2日 - 2020年3月4日）は、日本の俳優。山川県出身（海辺市生まれ）。"));
+        let p = x.entities.iter().find(|e| e.types == ["Person"]).unwrap();
+        assert_eq!(p.label, "山田 花子");
+        assert_eq!(time_of(claim(&x, &p.reference, "birth_date")).as_deref(), Some("1950年1月2日"));
+        assert_eq!(time_of(claim(&x, &p.reference, "death_date")).as_deref(), Some("2020年3月4日"));
+        // 出身地より出生地
+        assert_eq!(label_of(&x, claim(&x, &p.reference, "birth_place")).as_deref(), Some("海辺市"));
+
+        for (t, time) in [
+            ("『丸石の夏、海辺の秋』（まるいしのなつ）は、2001年7月1日に山川映画の配給で公開された日本映画。", "2001年7月1日"),
+            ("『丸石大戦争』は、1985年製作の日本映画。", "1985年"),
+        ] {
+            let x = rx.extract(&doc(t));
+            let w = x.entities.iter().find(|e| e.types == ["Movie"]).unwrap_or_else(|| panic!("{t}: {:?}", x.entities));
+            assert_eq!(time_of(claim(&x, &w.reference, "publication_date")).as_deref(), Some(time), "{t}");
+        }
+
+        let x = rx.extract(&doc("丸石駅（まるいしえき）は、山川県海辺市本町にある、丸石鉄道の駅である。"));
+        let st = x.entities.iter().find(|e| e.types == ["Station"]).unwrap();
+        assert_eq!(st.label, "丸石駅");
+        // `本町` は別の府の町なので、所在は海辺市
+        assert_eq!(label_of(&x, claim(&x, &st.reference, "located_in")).as_deref(), Some("海辺市"));
+    }
+
+    #[test]
+    fn fictional_topics_and_brackets() {
+        let x = RuleExtractor::new(Gazetteer::default());
+        let e = x.extract(&doc("丸石ヌイン（Maruishi Nuin）は、小説『星の丸石』における丸石戦争の第二の合戦である。"));
+        assert!(e.entities.iter().any(|e| e.types == ["Event"] && e.label == "丸石ヌイン"), "{:?}", e.entities);
+        // 題名の中の `!` `。` では文を区切らない
+        let e = x.extract(&doc("『止まるな!丸石。』（とまるな）は、2022年に公開された日本映画。"));
+        assert!(e.entities.iter().any(|e| e.label == "止まるな!丸石。"), "{:?}", e.entities);
+    }
+
+    #[test]
+    fn time_zones_and_words_are_not_places() {
+        let (kb, _) = kb_with(&[("海辺国", "Country", vec!["マリ"]), ("湾岸国", "Country", vec![])], &[]);
+        let x = RuleExtractor::from_kb(&kb).extract(&doc("2020年5月1日、湾岸時間の午後、マリンバ奏者が講演した。"));
+        assert!(x.entities.iter().all(|e| e.types != ["Place"] && !e.types.contains(&"Country".to_string())), "{:?}", x.entities);
+    }
+
+    #[test]
+    fn organization_names_and_anaphora() {
+        let (kb, ids) = gazetteer_kb();
+        let rx = RuleExtractor::from_kb(&kb);
+        // `山川県新聞` `山川県人` の地名は場所にしない
+        let x = rx.extract(&doc("山川県新聞によると、2020年5月1日、山川県人の男性が表彰された。"));
+        assert!(x.entities.iter().all(|e| e.resource.as_deref() != Some(ids["山川県"].as_str())), "{:?}", x.entities);
+        // `同市` は前に出てきた市
+        let x = rx.extract(&doc("海辺市の職員によると、2020年5月1日、同市で会議が開かれた。"));
+        let ev = x.entities.iter().find(|e| e.types == ["Event"]).unwrap();
+        assert_eq!(label_of(&x, claim(&x, &ev.reference, "took_place_at")).as_deref(), Some("海辺市"));
+    }
+
+    #[test]
+    fn news_dates_near_the_article() {
+        let rx = RuleExtractor::new(Gazetteer::default());
+        let news = |title: &str, text: &str| -> Extraction {
+            rx.extract(&serde_json::from_value(serde_json::json!({ "title": title, "text": text })).unwrap())
+        };
+        // 最初の文の日付が古い出来事なら、続く文の記事の日付に近い日付
+        let x = news("丸石氏の死去が判明", "【2020年3月13日】 丸石氏が2019年4月5日に死去していたことが分かった。丸石社が3月12日に発表した。");
+        let ev = x.entities.iter().find(|e| e.types == ["Event"]).unwrap();
+        assert_eq!(time_of(claim(&x, &ev.reference, "occurred_at")).as_deref(), Some("3月12日"));
+        // 日付が無ければ記事の日付以前
+        let x = news("丸石社が新製品", "【2020年3月13日】 丸石社は新しい製品を発表した。");
+        let ev = x.entities.iter().find(|e| e.types == ["Event"]).unwrap();
+        assert_eq!(time_of(claim(&x, &ev.reference, "occurred_at")).as_deref(), Some("2020年3月13日以前"));
+        // 予定を伝える記事には付けない
+        let x = news("丸石社が新製品発売へ", "【2020年3月13日】 丸石社は新しい製品を発売する予定だ。");
+        let ev = x.entities.iter().find(|e| e.types == ["Event"]).unwrap();
+        assert!(claim(&x, &ev.reference, "occurred_at").is_none());
+    }
+
+    #[test]
+    fn suffix_places_that_are_not_places() {
+        let x = RuleExtractor::new(Gazetteer::default());
+        for (t, bad) in [
+            ("2020年5月1日、丸石ホールディングスが会見した。", "丸石ホール"),
+            ("2020年5月1日、丸石前市長が会見した。", "丸石前市"),
+            ("2020年5月1日、丸石田園都市線丸石駅で事故が起きた。", "丸石田園都"),
+        ] {
+            let e = x.extract(&doc(t));
+            assert!(e.entities.iter().all(|e| e.label != bad), "{t}: {:?}", e.entities);
+        }
     }
 }
