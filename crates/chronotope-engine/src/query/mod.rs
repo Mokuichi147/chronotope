@@ -4,7 +4,9 @@
 //! - 3 段階ドリルダウン: `search`/`lookup`（Level 1 要約）→ `expand_claims`（Level 2 主張・異説・関係）
 //!   → `get_acquisition`（Level 3 出典・取得・抽出）。
 //! - 一意に決まらない結果は確定させない（`ambiguous`, `contested`, `comparable: false`）。
+//! - 会話履歴は `history_search` で候補を探し、`history_get` / `history_context` で原文と前後を確かめる。
 
+mod history;
 mod ops;
 mod render;
 mod search;
@@ -21,6 +23,8 @@ use serde_json::Value as Json;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+pub use history::{ContentEncoding, HistoryOrder, HistorySearch};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueryRequest {
@@ -225,7 +229,7 @@ pub enum QueryOp {
         #[serde(default)]
         valid_at: Option<String>,
     },
-    /// Level 3: 出典・取得・抽出。
+    /// Level 3: 出典・取得・抽出。スナップショット本文は `snapshot_offset` から `snapshot_length` バイトずつ読む。
     GetAcquisition {
         #[serde(default)]
         assertion: Option<AssertionId>,
@@ -233,6 +237,51 @@ pub enum QueryOp {
         acquisition: Option<AcquisitionId>,
         #[serde(default)]
         include_snapshot: bool,
+        #[serde(default)]
+        snapshot_offset: u64,
+        #[serde(default)]
+        snapshot_length: Option<u64>,
+        #[serde(default)]
+        snapshot_encoding: ContentEncoding,
+    },
+    /// 会話の原文イベントを本文・会話・種別・生成元・期間で探す。
+    HistorySearch(HistorySearch),
+    /// イベント ID から原文（ページ単位）と、呼び出し・訂正などの関連イベントを取得する。
+    HistoryGet {
+        event: String,
+        #[serde(default)]
+        owner: Option<String>,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default)]
+        length: Option<u64>,
+        #[serde(default)]
+        encoding: ContentEncoding,
+    },
+    /// イベントの前後を会話内の記録順で取得する（`conversation` だけなら末尾）。
+    HistoryContext {
+        #[serde(default)]
+        event: Option<String>,
+        #[serde(default)]
+        conversation: Option<String>,
+        #[serde(default)]
+        sequence: Option<u64>,
+        #[serde(default)]
+        owner: Option<String>,
+        #[serde(default)]
+        before: Option<usize>,
+        #[serde(default)]
+        after: Option<usize>,
+        /// 各イベントの本文を先頭から何バイトまで含めるか（0 で本文なし、最大 64 KiB）。
+        #[serde(default)]
+        max_content_bytes: Option<u64>,
+    },
+    /// 会話の一覧（イベント数・最後の記録順・欠けている記録順の数）。
+    HistoryConversations {
+        #[serde(default)]
+        owner: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     TemporalRelation {
         a: String,
@@ -456,7 +505,23 @@ impl KnowledgeBase {
             QueryOp::ExpandClaims { id, predicates, include_history, include_incoming, valid_at } => {
                 ops::expand_claims(&ctx, branch, id, predicates, *include_history, *include_incoming, valid_at.as_deref())?
             }
-            QueryOp::GetAcquisition { assertion, acquisition, include_snapshot } => ops::get_acquisition(&ctx, *assertion, *acquisition, *include_snapshot)?,
+            QueryOp::GetAcquisition { assertion, acquisition, include_snapshot, snapshot_offset, snapshot_length, snapshot_encoding } => {
+                let page = include_snapshot.then_some(ops::SnapshotPage { offset: *snapshot_offset, length: *snapshot_length, encoding: *snapshot_encoding });
+                ops::get_acquisition(&ctx, *assertion, *acquisition, page)?
+            }
+            QueryOp::HistorySearch(spec) => history::search(&ctx, spec)?,
+            QueryOp::HistoryGet { event, owner, offset, length, encoding } => history::get(&ctx, event, owner.as_deref(), *offset, *length, *encoding)?,
+            QueryOp::HistoryContext { event, conversation, sequence, owner, before, after, max_content_bytes } => history::context(
+                &ctx,
+                event.as_deref(),
+                conversation.as_deref(),
+                *sequence,
+                owner.as_deref(),
+                before.unwrap_or(5),
+                after.unwrap_or(5),
+                max_content_bytes.unwrap_or(4096),
+            )?,
+            QueryOp::HistoryConversations { owner, limit } => history::conversations(&ctx, owner.as_deref(), limit.unwrap_or(50))?,
             QueryOp::TemporalRelation { a, b } => ops::temporal_relation(&ctx, branch, a, b)?,
             QueryOp::Timeline { entity, work, place, types, limit } => {
                 ops::timeline(&ctx, branch, entity.as_deref(), work.as_deref(), place.as_deref(), types, limit.unwrap_or(50))?

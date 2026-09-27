@@ -9,6 +9,7 @@ Expand → Migrate → Contract のどの段階かを示す。
 | 0002_expand_projection.sql | expand | Search Projection（GiST / GIN 索引）・無効化キュー・Tier 0 関数 |
 | 0003_expand_rls.sql | expand | Assertion 単位の RLS・ロール |
 | 0004_expand_citus.sql | expand | Citus の分散配置（Citus が無ければ何もしない） |
+| 0005_expand_history.sql | expand | Source の所有者・Acquisition / Derivation の RLS・委任（`chronotope.on_behalf_of`）・会話イベント |
 
 ```bash
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/migrations/0001_expand_canonical.sql   # 以降同様

@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod embed;
 pub mod export;
 pub mod facts;
+pub mod history;
 pub mod index;
 pub mod kb;
 pub mod materialize;

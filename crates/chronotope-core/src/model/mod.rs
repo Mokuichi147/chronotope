@@ -1,6 +1,7 @@
 //! Canonical Knowledge Model のデータ型。
 
 pub mod assertion;
+pub mod conversation;
 pub mod identity;
 pub mod observation;
 pub mod predicate;
@@ -12,6 +13,7 @@ pub mod table;
 pub mod work;
 
 pub use assertion::*;
+pub use conversation::*;
 pub use identity::*;
 pub use observation::*;
 pub use predicate::*;

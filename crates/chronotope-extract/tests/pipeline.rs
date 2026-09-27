@@ -12,7 +12,7 @@ fn curator() -> Principal {
 }
 
 fn crawler() -> Principal {
-    Principal { actor: ActorRef { id: "news-crawler".into(), kind: ActorKind::Crawler }, groups: Default::default(), curator: false }
+    Principal { actor: ActorRef { id: "news-crawler".into(), kind: ActorKind::Crawler }, groups: Default::default(), curator: false, on_behalf_of: None }
 }
 
 fn w(kb: &mut KnowledgeBase, body: Value) -> Value {

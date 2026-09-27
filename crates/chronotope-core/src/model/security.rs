@@ -38,27 +38,50 @@ pub struct Principal {
     pub groups: BTreeSet<String>,
     #[serde(default)]
     pub curator: bool,
+    /// 委任元の所有者。所有者の代わりに動くエージェントが、所有者の非公開データを読み書きする。
+    /// 主体の種別（Agent など）やキュレーター権限は変えない。認証済みの前段が設定する。
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
 }
 
 impl Principal {
     pub fn system() -> Self {
-        Principal { actor: ActorRef::system(), groups: BTreeSet::new(), curator: true }
+        Principal { actor: ActorRef::system(), groups: BTreeSet::new(), curator: true, on_behalf_of: None }
     }
     pub fn agent(id: &str) -> Self {
-        Principal { actor: ActorRef { id: id.into(), kind: ActorKind::Agent }, groups: BTreeSet::new(), curator: false }
+        Principal { actor: ActorRef { id: id.into(), kind: ActorKind::Agent }, groups: BTreeSet::new(), curator: false, on_behalf_of: None }
     }
     pub fn curator(id: &str) -> Self {
-        Principal { actor: ActorRef { id: id.into(), kind: ActorKind::Human }, groups: BTreeSet::new(), curator: true }
+        Principal { actor: ActorRef { id: id.into(), kind: ActorKind::Human }, groups: BTreeSet::new(), curator: true, on_behalf_of: None }
     }
     pub fn anonymous() -> Self {
-        Principal { actor: ActorRef { id: "anonymous".into(), kind: ActorKind::Agent }, groups: BTreeSet::new(), curator: false }
+        Principal { actor: ActorRef { id: "anonymous".into(), kind: ActorKind::Agent }, groups: BTreeSet::new(), curator: false, on_behalf_of: None }
+    }
+
+    /// `owner` の代わりに動くエージェント。
+    pub fn delegated(id: &str, owner: &str) -> Self {
+        Principal { on_behalf_of: Some(owner.into()), ..Self::agent(id) }
+    }
+
+    pub fn is_anonymous(&self) -> bool {
+        self.actor.id == "anonymous"
+    }
+
+    /// 非公開データの所有者として扱う ID（委任されていれば委任元）。
+    pub fn owner_id(&self) -> &str {
+        self.on_behalf_of.as_deref().unwrap_or(&self.actor.id)
+    }
+
+    /// `owner` 本人か、`owner` から委任された主体か。
+    pub fn acts_for(&self, owner: &str) -> bool {
+        self.actor.id == owner || self.on_behalf_of.as_deref() == Some(owner)
     }
 
     pub fn can_see(&self, v: &Visibility) -> bool {
         match v {
             Visibility::Public => true,
             Visibility::Groups { groups } => self.actor.kind == ActorKind::System || groups.iter().any(|g| self.groups.contains(g)),
-            Visibility::Private { owner } => self.actor.kind == ActorKind::System || &self.actor.id == owner,
+            Visibility::Private { owner } => self.actor.kind == ActorKind::System || self.acts_for(owner),
         }
     }
 }

@@ -9,10 +9,13 @@
 //! - `POST /v1/ingest/text` … テキストから主張を抽出して取り込む（規則ベース、または渡された抽出結果）
 //!
 //! 認証は前段のゲートウェイで行う前提で、主体はヘッダ
-//! `x-chronotope-principal` / `x-chronotope-kind` / `x-chronotope-groups` / `x-chronotope-curator` から作る。
-//! ヘッダが無い場合は匿名エージェント（公開情報のみ・proposed でしか書けない）として扱う。
+//! `x-chronotope-principal` / `x-chronotope-kind` / `x-chronotope-groups` / `x-chronotope-curator` /
+//! `x-chronotope-on-behalf-of` から作る。ヘッダが無い場合は匿名エージェント
+//! （公開情報のみ・proposed でしか書けない・会話履歴は記録できない）として扱う。
+//! `x-chronotope-on-behalf-of` は、所有者から委任されたエージェントが所有者の非公開データ
+//! （会話履歴など）を扱うためのもので、ゲートウェイが委任を確認したときだけ付ける。
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -62,7 +65,8 @@ fn principal(h: &HeaderMap) -> Principal {
     let groups = get("x-chronotope-groups").map(|g| g.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
     // AI エージェントはキュレーターになれない。
     let curator = kind == ActorKind::Human && get("x-chronotope-curator") == Some("true");
-    Principal { actor: ActorRef { id, kind }, groups, curator }
+    let on_behalf_of = get("x-chronotope-on-behalf-of").map(str::to_string);
+    Principal { actor: ActorRef { id, kind }, groups, curator, on_behalf_of }
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, Error> + Send + 'static) -> Result<T, ApiError> {
@@ -150,7 +154,7 @@ async fn materialize(State(kb): State<Shared>) -> Result<impl IntoResponse, ApiE
     Ok(Json(json!({ "processed": n })))
 }
 
-pub async fn serve(kb: KnowledgeBase, addr: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn serve(kb: KnowledgeBase, addr: &str, interval_ms: u64, max_body_bytes: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let batch = kb.config().materialize_batch;
     let shared: Shared = Arc::new(RwLock::new(kb));
     let bg = shared.clone();
@@ -186,6 +190,8 @@ pub async fn serve(kb: KnowledgeBase, addr: &str, interval_ms: u64) -> Result<()
         .route("/v1/export/rdf", get(export_rdf))
         .route("/v1/materialize", post(materialize))
         .route("/v1/ingest/text", post(ingest_text))
+        // 大きなツール結果・添付も 1 イベントとして受け付ける（読み出しはページ単位）。
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(shared);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "chronotope agent API listening");

@@ -132,6 +132,10 @@ pub enum Command {
     ShredKey {
         key_id: KeyId,
     },
+    /// 会話の原文イベント。原文は同じ Revision の RegisterAcquisition が持つ。
+    RecordEvent {
+        event: ConversationEvent,
+    },
 }
 
 impl Command {
@@ -167,6 +171,7 @@ impl Command {
             Command::SetEmbedding { .. } => "set_embedding",
             Command::CreateKey { .. } => "create_key",
             Command::ShredKey { .. } => "shred_key",
+            Command::RecordEvent { .. } => "record_event",
         }
     }
 }

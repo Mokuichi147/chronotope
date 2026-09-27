@@ -44,12 +44,19 @@ impl ObjectStore for MemoryObjectStore {
 /// S3 互換ストレージへ置き換える場合もこのトレイトを実装すればよい。
 pub struct FsObjectStore {
     root: PathBuf,
+    /// 保存したオブジェクトを fsync してから返す。Revision ログは参照するオブジェクトの保存後に
+    /// 書くため、電源断の後もログが存在しないオブジェクトを指すことはない。
+    fsync: bool,
 }
 
 impl FsObjectStore {
     pub fn new(root: PathBuf) -> Result<Self> {
+        Self::with_fsync(root, false)
+    }
+
+    pub fn with_fsync(root: PathBuf, fsync: bool) -> Result<Self> {
         std::fs::create_dir_all(&root).map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(FsObjectStore { root })
+        Ok(FsObjectStore { root, fsync })
     }
 
     fn path(&self, h: &ContentHash) -> Result<PathBuf> {
@@ -70,9 +77,19 @@ impl ObjectStore for FsObjectStore {
         }
         let dir = p.parent().expect("object path has a parent");
         std::fs::create_dir_all(dir).map_err(|e| Error::Storage(e.to_string()))?;
+        let io = |e: std::io::Error| Error::Storage(e.to_string());
         let tmp = p.with_extension("tmp");
-        std::fs::write(&tmp, bytes).map_err(|e| Error::Storage(e.to_string()))?;
-        std::fs::rename(&tmp, &p).map_err(|e| Error::Storage(e.to_string()))?;
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(io)?;
+            std::io::Write::write_all(&mut f, bytes).map_err(io)?;
+            if self.fsync {
+                f.sync_all().map_err(io)?;
+            }
+        }
+        std::fs::rename(&tmp, &p).map_err(io)?;
+        if self.fsync {
+            std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
+        }
         Ok((h, true))
     }
     fn get(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>> {

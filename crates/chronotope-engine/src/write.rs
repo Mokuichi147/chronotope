@@ -20,7 +20,7 @@ use chronotope_core::vocab::keys;
 use chronotope_core::*;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 // ------------------------------------------------------------------ inputs
 
@@ -203,7 +203,62 @@ pub struct LinkSource {
     /// 情報源を表す Resource（Document / Post）。`{"new": {...}}` で同時作成できる。
     #[serde(default)]
     pub resource: Option<ResourceRef>,
+    /// 新しい Source の可視性（既定: 公開）。非公開にすると、同じ URL でも所有者・グループごとに別の
+    /// Source になり、取得記録とスナップショットは閲覧できる主体にだけ返す。
+    #[serde(default)]
+    pub visibility: Option<Visibility>,
     pub acquisition: AcquisitionInput,
+}
+
+/// 会話の原文イベント（`record_event` / `record_events`）。所有者は認証済みの主体から決まる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventInput {
+    /// クライアントが保存前に採番する ID。同じ ID・同じ内容の再送は既存の記録を返す。
+    pub event_id: String,
+    pub conversation: String,
+    #[serde(default)]
+    pub turn: Option<String>,
+    pub sequence: u64,
+    pub kind: EventKind,
+    /// 実際の生成元（必須）。分からなければ `unknown` を明示する。
+    pub origin: EventOrigin,
+    #[serde(default)]
+    pub api_role: Option<String>,
+    #[serde(default)]
+    pub speaker: Option<String>,
+    #[serde(default)]
+    pub received_at: Option<String>,
+    #[serde(default)]
+    pub response_id: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<String>,
+    #[serde(default)]
+    pub parent_event: Option<String>,
+    #[serde(default)]
+    pub status: Option<EventStatus>,
+    #[serde(default)]
+    pub supersedes: Option<String>,
+    #[serde(default)]
+    pub derived_from: Vec<String>,
+    #[serde(default)]
+    pub metadata: Option<Json>,
+    /// 原文（テキスト）。整形・正規化せずに送る。
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub content_base64: Option<String>,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// 送信側で計算した `blake3:<hex>`。指定すると受信した原文と照合する。
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub encrypt_with: Option<KeyId>,
+    /// 会話の可視性（既定: 所有者だけ）。会話の最初のイベントで決まる。
+    #[serde(default)]
+    pub visibility: Option<Visibility>,
+    #[serde(default)]
+    pub conversation_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -318,6 +373,10 @@ pub enum WriteRequest {
         approve: bool,
     },
     LinkSource(Box<LinkSource>),
+    RecordEvent(Box<EventInput>),
+    RecordEvents {
+        events: Vec<EventInput>,
+    },
     AddObservation {
         target: String,
         metric: String,
@@ -427,6 +486,27 @@ struct Batch {
 impl KnowledgeBase {
     fn require_curator(&self, p: &Principal, what: &str) -> Result<()> {
         if p.curator && !p.actor.is_ai() { Ok(()) } else { Err(Error::forbidden(format!("{what} requires a human curator"))) }
+    }
+
+    /// 根拠として参照する取得記録。閲覧できない Source の取得記録は参照させない。
+    fn visible_acquisition(&self, p: &Principal, id: AcquisitionId) -> Result<&Acquisition> {
+        let acq = self.store.acquisitions.get(&id).ok_or_else(|| Error::not_found(format!("acquisition {id}")))?;
+        match self.store.sources.get(&acq.source) {
+            Some(s) if !p.can_see(&s.visibility) => Err(Error::forbidden(format!("acquisition {id} is not visible to this principal"))),
+            _ => Ok(acq),
+        }
+    }
+
+    /// 新しく作る非公開データの可視性。作成者自身が見えない可視性や、他人を所有者にした可視性は作らせない。
+    fn check_new_visibility(&self, p: &Principal, v: &Visibility) -> Result<()> {
+        match v {
+            Visibility::Public => Ok(()),
+            Visibility::Private { owner } if p.acts_for(owner) || p.actor.kind == ActorKind::System => Ok(()),
+            Visibility::Private { owner } => Err(Error::forbidden(format!("cannot create data owned by `{owner}`"))),
+            Visibility::Groups { groups } if groups.is_empty() => Err(Error::invalid("group visibility needs at least one group")),
+            Visibility::Groups { .. } if p.can_see(v) => Ok(()),
+            Visibility::Groups { .. } => Err(Error::forbidden("the principal is not a member of any of the groups")),
+        }
     }
 
     fn branch_or_main(&self, b: &Option<String>) -> Result<BranchId> {
@@ -620,7 +700,7 @@ impl KnowledgeBase {
         let mut evidence = vec![];
         let mut first_known = self.now();
         for e in &input.evidence {
-            let acq = self.store.acquisitions.get(&e.acquisition).ok_or_else(|| Error::not_found(format!("acquisition {}", e.acquisition)))?;
+            let acq = self.visible_acquisition(p, e.acquisition)?;
             first_known = first_known.min(acq.acquired_at);
             let derivation = match &e.derivation {
                 Some(d) => Some(self.derivation_cmd(e.acquisition, d, batch)?),
@@ -787,9 +867,7 @@ impl KnowledgeBase {
                 let branch = self.branch_or_main(&branch)?;
                 let a = self.store.assertions.get(&id).ok_or_else(|| Error::not_found(format!("assertion {id}")))?;
                 let own = a.asserted_by.id == p.actor.id;
-                let basis = basis_acquisition
-                    .map(|q| self.store.acquisitions.get(&q).map(|x| x.acquired_at).ok_or_else(|| Error::not_found(format!("acquisition {q}"))))
-                    .transpose()?;
+                let basis = basis_acquisition.map(|q| self.visible_acquisition(p, q).map(|x| x.acquired_at)).transpose()?;
                 let to = if p.curator && !p.actor.is_ai() || own {
                     AssertionStatus::Retracted
                 } else {
@@ -841,9 +919,7 @@ impl KnowledgeBase {
             WriteRequest::AddEvidence { assertion, evidence } => {
                 let a = self.store.assertions.get(&assertion).ok_or_else(|| Error::not_found(format!("assertion {assertion}")))?;
                 let branch = a.branch;
-                if !self.store.acquisitions.contains_key(&evidence.acquisition) {
-                    return Err(Error::not_found(format!("acquisition {}", evidence.acquisition)));
-                }
+                self.visible_acquisition(p, evidence.acquisition)?;
                 let derivation = evidence.derivation.as_ref().map(|d| self.derivation_cmd(evidence.acquisition, d, &mut batch)).transpose()?;
                 batch.cmds.push(Command::AddEvidence { id: assertion, evidence: Evidence { acquisition: evidence.acquisition, derivation } });
                 self.commit_batch(p, branch, "add_evidence", rev, batch, json!({ "id": assertion, "derivation": derivation }))
@@ -905,13 +981,22 @@ impl KnowledgeBase {
                 self.commit_batch(p, BranchId::main(), "decide_merge", rev, batch, json!({ "proposal": id, "approved": approve, "from": from, "into": into }))
             }
             WriteRequest::LinkSource(input) => self.link_source(p, *input, rev, batch),
+            WriteRequest::RecordEvent(input) => {
+                let mut out = self.record_events(p, vec![*input], rev, batch)?;
+                let mut one = out["events"].as_array_mut().and_then(|v| v.pop()).unwrap_or(Json::Null);
+                for k in ["revision", "owner", "warnings"] {
+                    if let Some(v) = out.get(k) {
+                        one[k] = v.clone();
+                    }
+                }
+                Ok(one)
+            }
+            WriteRequest::RecordEvents { events } => self.record_events(p, events, rev, batch),
             WriteRequest::AddObservation { target, metric, observed_at, value, unit, acquisition, branch } => {
                 let target = self.resolve_ref_str(&target)?;
                 let branch = self.branch_or_main(&branch)?;
                 if let Some(a) = acquisition {
-                    if !self.store.acquisitions.contains_key(&a) {
-                        return Err(Error::not_found(format!("acquisition {a}")));
-                    }
+                    self.visible_acquisition(p, a)?;
                 }
                 let id = ObservationId::new();
                 batch.cmds.push(Command::AddObservation {
@@ -923,6 +1008,9 @@ impl KnowledgeBase {
                 let target = self.resolve_ref_str(&target)?;
                 if self.store.frames.get(&frame).is_none() {
                     return Err(Error::not_found(format!("frame {frame}")));
+                }
+                if let Some(a) = acquisition {
+                    self.visible_acquisition(p, a)?;
                 }
                 let samples = samples
                     .iter()
@@ -1134,22 +1222,26 @@ impl KnowledgeBase {
     fn link_source(&mut self, p: &Principal, input: LinkSource, rev: RevisionId, mut batch: Batch) -> Result<Json> {
         let acquired_at = parse_time(&input.acquisition.acquired_at, "acquisition.acquired_at")?;
         let locator = input.locator.clone().or(input.url.clone().map(|url| Locator::Url { url }));
+        let visibility = input.visibility.clone().unwrap_or_default();
+        self.check_new_visibility(p, &visibility)?;
         let (source_id, new_source) = match (input.source, &locator) {
             (Some(s), _) => {
-                if !self.store.sources.contains_key(&s) {
-                    return Err(Error::not_found(format!("source {s}")));
+                let src = self.store.sources.get(&s).ok_or_else(|| Error::not_found(format!("source {s}")))?;
+                if !p.can_see(&src.visibility) {
+                    return Err(Error::forbidden(format!("source {s} is not visible to this principal")));
                 }
                 (s, false)
             }
-            (None, Some(loc)) => match self.store.source_by_locator.get(&loc.key()) {
+            (None, Some(loc)) => match self.store.source_by_locator.get(&loc.scoped_key(&visibility)) {
                 Some(s) => (*s, false),
                 None => (SourceId::new(), true),
             },
             (None, None) => return Err(Error::invalid("either `source`, `url` or `locator` is required")),
         };
         if let Some(root) = input.provenance_root {
-            if !self.store.sources.contains_key(&root) {
-                return Err(Error::not_found(format!("provenance_root source {root}")));
+            let src = self.store.sources.get(&root).ok_or_else(|| Error::not_found(format!("provenance_root source {root}")))?;
+            if !p.can_see(&src.visibility) {
+                return Err(Error::forbidden(format!("source {root} is not visible to this principal")));
             }
         }
         if let Some(l) = &input.license {
@@ -1173,7 +1265,7 @@ impl KnowledgeBase {
                     reliability: input.reliability,
                     provenance_root: input.provenance_root,
                     license: input.license.clone(),
-                    visibility: Visibility::Public,
+                    visibility,
                     registered_at: self.now(),
                 },
             });
@@ -1188,21 +1280,11 @@ impl KnowledgeBase {
         let mut snapshot_ref = None;
         let mut deduplicated = false;
         if let Some(bytes) = bytes {
-            // content_hash は常に平文のハッシュ。暗号化時は保存物（暗号文）のハッシュを snapshot_ref に持つ。
-            let plain_hash = content_hash(&bytes);
-            let (stored, encrypted_with) = match acq.encrypt_with {
-                Some(k) => {
-                    let (nonce, ct) = self.vault.encrypt_bytes(k, &bytes)?;
-                    let mut v = hex::decode(&nonce).map_err(|e| Error::Storage(e.to_string()))?;
-                    v.extend(ct);
-                    (v, Some(k))
-                }
-                None => (bytes.clone(), None),
-            };
-            let (h, fresh) = self.objects.put(&stored)?;
-            deduplicated = !fresh;
-            snapshot_ref = Some(ObjectRef { hash: h, size: stored.len() as u64, media_type: acq.media_type.clone(), encrypted_with });
-            content_hash_v = Some(if encrypted_with.is_some() { ContentHash("withheld:encrypted".into()) } else { plain_hash });
+            // content_hash は平文のハッシュ（暗号化時は伏せる）。保存物（暗号文）のハッシュは snapshot_ref に持つ。
+            let (r, h, dedup) = self.put_snapshot(&bytes, acq.encrypt_with, acq.media_type.clone())?;
+            deduplicated = dedup;
+            snapshot_ref = Some(r);
+            content_hash_v = Some(h);
         }
         let acquisition_id = AcquisitionId::new();
         batch.cmds.push(Command::RegisterAcquisition {
@@ -1228,4 +1310,233 @@ impl KnowledgeBase {
         });
         self.commit_batch(p, BranchId::main(), "link_source", rev, batch, json!({ "source": source_id, "new_source": new_source, "acquisition": acquisition_id, "content_hash": content_hash_v, "snapshot_deduplicated": deduplicated }))
     }
+
+    /// 会話の原文イベントをまとめて記録する。イベント ID で冪等:
+    /// 同じ ID・同じ内容の再送は既存の記録を返し、同じ ID で内容が違えば `conflict` にする。
+    /// 本文が同じでも ID が違えば別のイベントとして両方残す。
+    fn record_events(&mut self, p: &Principal, inputs: Vec<EventInput>, rev: RevisionId, mut batch: Batch) -> Result<Json> {
+        const MAX_EVENTS: usize = 1000;
+        if p.is_anonymous() {
+            return Err(Error::forbidden("conversation events need an authenticated principal"));
+        }
+        if inputs.is_empty() || inputs.len() > MAX_EVENTS {
+            return Err(Error::invalid(format!("record_events takes 1..={MAX_EVENTS} events")));
+        }
+        let owner = p.owner_id().to_string();
+        let now = self.now();
+        let mut results = Vec::with_capacity(inputs.len());
+        // 同じリクエスト内で先に出てきたイベント（再送の重複と、記録順の衝突の検出用）。
+        let mut pending: HashMap<String, (EventFields, ContentHash, Json)> = HashMap::new();
+        let mut pending_seq: HashMap<(String, u64), String> = HashMap::new();
+        let mut pending_source: HashMap<String, SourceId> = HashMap::new();
+        let mut recorded = 0usize;
+        for input in inputs {
+            for (what, v) in [("event_id", Some(&input.event_id)), ("conversation", Some(&input.conversation))].into_iter().chain([
+                ("turn", input.turn.as_ref()),
+                ("call_id", input.call_id.as_ref()),
+                ("response_id", input.response_id.as_ref()),
+            ]) {
+                if let Some(v) = v {
+                    check_client_id(what, v)?;
+                }
+            }
+            let bytes = match (&input.content, &input.content_base64) {
+                (Some(t), None) => t.as_bytes().to_vec(),
+                (None, Some(b)) => base64::engine::general_purpose::STANDARD.decode(b).map_err(|e| Error::invalid(format!("content_base64: {e}")))?,
+                _ => return Err(Error::invalid(format!("event `{}` needs exactly one of `content` or `content_base64`", input.event_id))),
+            };
+            let plain_hash = content_hash(&bytes);
+            if let Some(h) = &input.content_hash {
+                if h != &plain_hash.0 {
+                    return Err(Error::invalid(format!("event `{}`: content_hash {h} does not match the received content ({})", input.event_id, plain_hash.0)));
+                }
+            }
+            let fields = EventFields {
+                conversation: input.conversation.clone(),
+                turn: input.turn.clone(),
+                sequence: input.sequence,
+                kind: input.kind,
+                origin: input.origin,
+                api_role: input.api_role.clone(),
+                speaker: input.speaker.clone(),
+                received_at: input.received_at.as_deref().map(|t| parse_time(t, "received_at")).transpose()?,
+                response_id: input.response_id.clone(),
+                call_id: input.call_id.clone(),
+                parent_event: input.parent_event.clone(),
+                status: input.status,
+                supersedes: input.supersedes.clone(),
+                derived_from: input.derived_from.clone(),
+                metadata: input.metadata.clone(),
+            };
+            let conv = input.conversation.clone();
+
+            if let Some(existing) = self.history.event(&owner, &input.event_id) {
+                self.check_resend(existing, &fields, &bytes, &plain_hash)?;
+                results.push(
+                    json!({ "event_id": existing.event_id, "duplicate": true, "sequence": existing.fields.sequence, "acquisition": existing.acquisition }),
+                );
+                continue;
+            }
+            if let Some((f, h, first)) = pending.get(&input.event_id) {
+                if f != &fields || h != &plain_hash {
+                    return Err(Error::Conflict(format!("event `{}` appears twice in the request with different contents", input.event_id)));
+                }
+                let mut again = first.clone();
+                again["duplicate"] = json!(true);
+                results.push(again);
+                continue;
+            }
+            if let Some(d) = self.history.at_sequence(&owner, &conv, input.sequence) {
+                let other = self.history.get(d).map(|e| e.event_id.clone()).unwrap_or_default();
+                return Err(Error::Conflict(format!("sequence {} in conversation `{conv}` is already used by event `{other}`", input.sequence)));
+            }
+            if let Some(other) = pending_seq.insert((conv.clone(), input.sequence), input.event_id.clone()) {
+                return Err(Error::Conflict(format!(
+                    "sequence {} in conversation `{conv}` is used by both `{other}` and `{}`",
+                    input.sequence, input.event_id
+                )));
+            }
+
+            // 会話を表す Source（会話の最初のイベントで作り、可視性もそこで決まる）。
+            let existing_source = self
+                .history
+                .conversation(&owner, &conv)
+                .and_then(|m| m.values().next())
+                .and_then(|d| self.history.get(*d))
+                .map(|e| e.source)
+                .or_else(|| pending_source.get(&conv).copied());
+            let source = match existing_source {
+                Some(sid) => {
+                    if let (Some(v), Some(src)) = (&input.visibility, self.store.sources.get(&sid)) {
+                        if &src.visibility != v {
+                            return Err(Error::Conflict(format!("conversation `{conv}` was recorded with a different visibility")));
+                        }
+                    }
+                    sid
+                }
+                None => {
+                    let visibility = input.visibility.clone().unwrap_or(Visibility::Private { owner: owner.clone() });
+                    self.check_new_visibility(p, &visibility)?;
+                    let locator = Locator::Conversation { conversation: conv.clone() };
+                    let sid = match self.store.source_by_locator.get(&locator.scoped_key(&visibility)) {
+                        Some(s) => *s,
+                        None => {
+                            let sid = SourceId::new();
+                            batch.cmds.push(Command::RegisterSource {
+                                source: Source {
+                                    id: sid,
+                                    kind: SourceKind::Conversation,
+                                    locator,
+                                    title: input.conversation_title.clone(),
+                                    resource: None,
+                                    publisher: None,
+                                    source_time: None,
+                                    origin: SourceOrigin::Primary,
+                                    reliability: None,
+                                    provenance_root: None,
+                                    license: None,
+                                    visibility,
+                                    registered_at: now,
+                                },
+                            });
+                            sid
+                        }
+                    };
+                    pending_source.insert(conv.clone(), sid);
+                    sid
+                }
+            };
+
+            let media_type = input.media_type.clone().or_else(|| input.content.is_some().then(|| "text/plain; charset=utf-8".to_string()));
+            let (snapshot, shown_hash, _) = self.put_snapshot(&bytes, input.encrypt_with, media_type)?;
+            let acquisition = AcquisitionId::new();
+            batch.cmds.push(Command::RegisterAcquisition {
+                acquisition: Acquisition {
+                    id: acquisition,
+                    source,
+                    acquired_at: fields.received_at.unwrap_or(now),
+                    acquired_by: p.actor.clone(),
+                    method: AcquisitionMethod::Api,
+                    locator: Locator::ConversationEvent { conversation: conv.clone(), event: input.event_id.clone(), sequence: input.sequence },
+                    content_hash: Some(shown_hash.clone()),
+                    snapshot_ref: Some(snapshot),
+                    recorded_at: now,
+                },
+            });
+            let known = |id: &String| self.history.event(&owner, id).is_some() || pending.contains_key(id);
+            for (what, r) in fields
+                .supersedes
+                .iter()
+                .map(|r| ("supersedes", r))
+                .chain(fields.parent_event.iter().map(|r| ("parent_event", r)))
+                .chain(fields.derived_from.iter().map(|r| ("derived_from", r)))
+            {
+                if !known(r) {
+                    batch.warnings.push(format!("event `{}`: {what} `{r}` has not been recorded yet", input.event_id));
+                }
+            }
+            let result = json!({
+                "event_id": input.event_id,
+                "duplicate": false,
+                "sequence": input.sequence,
+                "acquisition": acquisition,
+                "content_hash": shown_hash,
+                "size": bytes.len(),
+            });
+            batch.cmds.push(Command::RecordEvent {
+                event: ConversationEvent {
+                    owner: owner.clone(),
+                    event_id: input.event_id.clone(),
+                    fields: fields.clone(),
+                    source,
+                    acquisition,
+                    size: bytes.len() as u64,
+                    recorded_by: p.actor.clone(),
+                    recorded_at: now,
+                },
+            });
+            pending.insert(input.event_id.clone(), (fields, plain_hash, result.clone()));
+            results.push(result);
+            recorded += 1;
+        }
+        let out = json!({ "owner": owner, "events": results, "recorded": recorded });
+        if batch.cmds.is_empty() {
+            // すべて再送（記録済み）。新しい Revision は作らない。
+            let mut out = out;
+            out["revision"] = json!(self.store.head_seq);
+            return Ok(out);
+        }
+        self.commit_batch(p, BranchId::main(), "record_events", rev, batch, out)
+    }
+
+    /// 記録済みのイベントと再送されたイベントが同じか。
+    fn check_resend(&self, existing: &ConversationEvent, fields: &EventFields, bytes: &[u8], plain_hash: &ContentHash) -> Result<()> {
+        let conflict = |what: &str| Err(Error::Conflict(format!("event `{}` was already recorded with a different {what}", existing.event_id)));
+        if &existing.fields != fields {
+            return conflict("metadata");
+        }
+        let acq = self.store.acquisitions.get(&existing.acquisition);
+        match acq.and_then(|a| a.content_hash.as_ref()) {
+            Some(h) if !h.0.starts_with("withheld:") => {
+                if h != plain_hash {
+                    return conflict("content");
+                }
+            }
+            _ => match acq.and_then(|a| a.snapshot_ref.as_ref()).map(|r| self.read_snapshot(r)).transpose()? {
+                Some(Ok(stored)) if stored == bytes => {}
+                Some(Ok(_)) => return conflict("content"),
+                Some(Err(why)) => return Err(Error::Conflict(format!("event `{}` cannot be compared: {}", existing.event_id, why.as_str()))),
+                None => return conflict("content"),
+            },
+        }
+        Ok(())
+    }
+}
+
+/// クライアントが採番する ID（イベント・会話・呼び出しなど）。
+fn check_client_id(what: &str, v: &str) -> Result<()> {
+    if v.is_empty() || v.len() > 256 || v.chars().any(char::is_control) {
+        return Err(Error::invalid(format!("`{what}` must be 1..=256 bytes without control characters")));
+    }
+    Ok(())
 }

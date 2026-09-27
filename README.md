@@ -51,8 +51,11 @@ cargo run --release --bin chronotope -- bench --events 100000
 | POST | `/v1/ingest/text` | テキストから主張を抽出して取り込む（`{"document": {...}, "extraction": {...}?, "dry_run": false}`） |
 
 主体はヘッダ `x-chronotope-principal` / `x-chronotope-kind`（`agent` / `human` / `crawler` / `sensor`）/
-`x-chronotope-groups` / `x-chronotope-curator` から作ります。認証は前段のゲートウェイで行う前提です
+`x-chronotope-groups` / `x-chronotope-curator` / `x-chronotope-on-behalf-of` から作ります。認証は前段のゲートウェイで行う前提です
 （ヘッダが無ければ匿名エージェント。AI エージェントはキュレーターになれません）。
+`x-chronotope-on-behalf-of` は、所有者から委任されたエージェントが所有者の非公開データ（会話履歴など）を扱うためのもので、
+ゲートウェイが委任を確認したときだけ付けます。主体の種別や権限は変わりません。
+リクエスト本文の上限は `serve --max-body-bytes`（既定 64 MiB）です。
 
 ```bash
 curl -s localhost:7878/v1/query -H 'content-type: application/json' -d '{
@@ -83,7 +86,8 @@ curl -s localhost:7878/v1/write -H 'content-type: application/json' -H 'x-chrono
 | `search` | 1 | 型・関係・作品・場所（包含階層 / bbox / 半径）・時間窓（possibly / certainly / within）・全文・ベクトル・canon / timeline / 過去時点。Level 1 要約（約 80 トークン） |
 | `similar` | 1 | 意味・時間・空間・実体重複・作品・グラフ距離・ランクの多特徴類似 |
 | `expand_claims` | 1 | Level 2: 述語ごとの優先値・異説・否定・履歴・被参照・同一性候補 |
-| `get_acquisition` | 1 | Level 3: 出典・取得（acquired_at）・抽出（モデル・版・スパン）・スナップショット（ライセンスで制御） |
+| `get_acquisition` | 1 | Level 3: 出典・取得（acquired_at）・抽出（モデル・版・スパン）・スナップショット（ライセンスと出典の可視性で制御。`snapshot_offset` / `snapshot_length` で全文をページ取得） |
+| `history_search` / `history_get` / `history_context` / `history_conversations` | 1 | 会話履歴の検索 / 原文と関連イベント / 前後の記録 / 会話の一覧（[会話履歴](#会話履歴)） |
 | `temporal_relation` | 1 | 2 つの出来事のあり得る Allen 関係。時間軸が違えば `comparable: false` |
 | `timeline` | 1 | 時間軸ごとの年表と、絶対時刻の無い出来事の部分順序 |
 | `neighbors` | 1 | 関係の近傍探索（深さ 3 まで） |
@@ -98,11 +102,53 @@ curl -s localhost:7878/v1/write -H 'content-type: application/json' -H 'x-chrono
 ### 書き込み操作（`op`）
 
 `propose_assertion` / `retract_assertion` / `supersede_assertion` / `dispute_assertion` / `merge_identity` /
-`link_source` / `add_evidence` / `add_observation` / `add_trajectory` / `propose_predicate` / `propose_type` /
+`link_source` / `record_event` / `record_events` / `add_evidence` / `add_observation` / `add_trajectory` / `propose_predicate` / `propose_type` /
 `create_resource` / `update_resource` / `create_branch` / `define_sequence` / `define_table` / `add_table_rows` /
 `link_row` / `set_embedding` / `create_key`、キュレーター専用の `accept_assertion` / `verify_assertion` /
 `decide_merge` / `accept_predicate` / `define_calendar` / `define_frame` / `define_license` / `set_rank_policy` /
 `shred_key`。
+
+`link_source` は `"visibility": {"level": "private", "owner": "<自分>"}` などで非公開の出典を登録できます。
+非公開の出典は同じ URL でも所有者・グループごとに別の Source になり、取得記録・スナップショット・根拠としての参照は
+閲覧できる主体に限られます（Acquisition ID を直接指定しても、見えなければ `not_found`）。
+
+## 会話履歴
+
+AI エージェントとのやり取り（入力・応答・ツールの呼び出しと結果）を原文のまま保存し、後から正確に参照するための機能です。
+要約や類似検索は候補探しに使い、回答・引用は取得した原文に基づけることを前提にしています。
+
+- 1 イベント = 1 回の発言・ツール呼び出し・結果。会話は所有者だけが見える Source、イベントはその Acquisition になり、
+  原文はバイト列のままスナップショットとして保存します（整形・正規化しない）。要約・抽出した知識はこの Acquisition を根拠に参照できます。
+- 所有者は認証済みの主体（委任されていれば委任元）で、リクエストでは指定できません。匿名の主体は記録できません。
+- `event_id` はクライアントが保存前に採番します。同じ ID・同じ内容の再送は既存の記録を返し（Revision も増えない）、
+  同じ ID で内容が違う場合や、会話内の記録順（`sequence`）が別のイベントと重なる場合は `conflict` です。本文が同じでも ID が違えば両方残します。
+- `origin`（`human` / `model` / `tool` / `runtime` / `system` / `agent` / `unknown`）は必須で、API 上の role（`api_role`）とは別に持ちます。
+  自動継続の指示は `api_role: "user"` でも `origin: "runtime"` とし、ユーザー本人の発言と区別できます。移行などで分からなければ `unknown` を明示します。
+- ツールの呼び出しと結果は `call_id` で結び、`status`（`ok` / `error` / `interrupted` / `unknown`）で中断や結果不明を成功と区別します。
+  訂正は `supersedes`、要約の元は `derived_from`、因果関係は `parent_event` で指し、過去のイベントは上書きしません。
+
+```bash
+curl -s localhost:7878/v1/write -H 'content-type: application/json' -H 'x-chronotope-principal: alice' -H 'x-chronotope-kind: human' -d '{
+  "op": "record_events",
+  "events": [
+    { "event_id": "e-001", "conversation": "c-1", "sequence": 1, "kind": "message", "origin": "human", "api_role": "user",
+      "received_at": "2026-09-27T10:00:00+09:00", "content": "  ビルドを消して\n" },
+    { "event_id": "e-002", "conversation": "c-1", "sequence": 2, "kind": "message", "origin": "runtime", "api_role": "user",
+      "content": "続けてください" }
+  ]
+}'
+```
+
+| op | 内容 |
+|---|---|
+| `history_search` | 本文（正規化後の部分一致。`exact: true` で原文どおりの連続一致）・会話・`kinds`・`origins`・`call_id`・期間で探す。一致位置（原文のバイト範囲）と抜粋、`next_cursor` を返す |
+| `history_get` | イベント ID から原文を `offset` / `length` バイトずつ返す（UTF-8 の文字境界で区切り、`next_offset` が `null` になるまで読めば欠落なく復元できる。原文全体の `content_hash` 付き）。呼び出しと結果・訂正・要約元などの関連イベントも返す |
+| `history_context` | イベント（または会話と記録順）の前後を記録順で返す。`conversation` だけなら末尾。記録順の欠け（未同期の可能性）を `gaps` で示す |
+| `history_conversations` | 会話ごとのイベント数・最後の記録順・欠けている記録順の数（同期の再開位置の確認用） |
+
+本文の索引はコミットと同時に更新するため、記録直後の検索にも索引の遅れはありません。UTF-8 でない本文や鍵を破棄した本文は
+本文検索の対象外で、その件数を `not_text_searchable` と警告で返します。検索で見つからなかったことは、その発言が無かったことを意味しません。
+CJK・英数字とも文字 bigram で候補を絞ってから原文で照合するので、語の途中から始まる検索語も取りこぼしません（1 文字だけの語は全件を照合）。
 
 ## テキストからの取り込み
 
@@ -195,7 +241,7 @@ cargo run --release --bin chronotope -- ingest-text --data ./data --url https://
 | 30 書き込み API | 意味的 API のみ。AI の追加は proposed から |
 | 31 レイテンシ Tier | 応答の `tier`（tier0 / tier1 / tier2）。Tier 2（矛盾検出等）はオンライン検索経路と別操作 |
 | 32–33 物理構成 | `sql/migrations`（PostgreSQL / Citus、テーブルごとの分散キー）、Object Storage、列指向ストアの境界 |
-| 34 セキュリティ・法的要件 | Assertion 単位の可視性（エンジン内判定 + PostgreSQL RLS）、license / redistributable を API で強制（スナップショット本文・RDF 出力）、crypto-shredding（ChaCha20-Poly1305、鍵はログに書かない） |
+| 34 セキュリティ・法的要件 | Assertion・Source 単位の可視性（エンジン内判定 + PostgreSQL RLS。Acquisition・会話イベントは Source の可視性に従う）、所有者からの委任（`on_behalf_of`）、license / redistributable を API で強制（スナップショット本文・RDF 出力）、crypto-shredding（ChaCha20-Poly1305、鍵はログに書かない。破棄した本文は会話の索引からも外す） |
 | 35 Schema Migration | `sql/README.md` に Expand → Migrate → Contract の手順 |
 
 ## 計測（Apple Silicon、`--release`）
@@ -221,6 +267,11 @@ Search Projection には行単位 RLS を掛けていません。RLS の securit
 
 ## 現時点の制約と今後
 
+- Revision ログとスナップショットは既定で書き込みごとに fsync します（`serve --no-fsync` で省略）。スナップショットを
+  保存してからログを書くため、ログが存在しないオブジェクトを指すことはありません。クラッシュでログ末尾に残った書きかけの
+  Revision は起動時に切り捨てます（その Revision は呼び出し元には失敗として返っていたものです）。
+- 会話履歴の本文索引はメモリ上にあり、起動時に Revision ログとスナップショットから作り直します。1 リクエストで送れるイベントは 1000 件までで、
+  1 イベントの本文はリクエスト本文の上限に収まる必要があります（読み出しはページ単位）。
 - 稼働中のエンジンは Canonical をメモリに持ち、Revision ログ（JSONL）で永続化します。PostgreSQL / Citus は
   スキーマと COPY 形式の一括エクスポートまでで、エンジンが直接読み書きするバックエンドはまだありません。
   Phase 0 の「Citus で 1000 万件」は未計測です（インメモリ 100 万件・単一 PostgreSQL 10 万件で計測）。

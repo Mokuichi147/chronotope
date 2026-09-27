@@ -667,3 +667,426 @@ fn persistence_replays_revision_log() {
     assert_eq!(kb.store().acquisitions.len(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ------------------------------------------------------------------ 会話履歴
+
+fn user(id: &str) -> Principal {
+    let mut p = Principal::agent(id);
+    p.actor.kind = chronotope_core::model::ActorKind::Human;
+    p
+}
+
+fn event(id: &str, conv: &str, seq: u64, kind: &str, origin: &str, content: &str) -> Value {
+    json!({ "event_id": id, "conversation": conv, "sequence": seq, "kind": kind, "origin": origin, "content": content })
+}
+
+fn record(kb: &mut KnowledgeBase, p: &Principal, events: Vec<Value>) -> Value {
+    w(kb, p, json!({ "op": "record_events", "events": events }))
+}
+
+fn hq(kb: &KnowledgeBase, p: &Principal, mut body: Value) -> Value {
+    body["budget_ms"] = json!(2000);
+    q(kb, p, body)["results"].clone()
+}
+
+fn read_all(kb: &KnowledgeBase, p: &Principal, event_id: &str, page: u64) -> (String, Value) {
+    let mut out = String::new();
+    let mut offset = 0u64;
+    loop {
+        let r = hq(kb, p, json!({ "op": "history_get", "event": event_id, "offset": offset, "length": page }));
+        let c = &r["content"];
+        assert_eq!(c["encoding"], "utf-8");
+        assert_eq!(c["range"]["start"], offset);
+        out.push_str(c["text"].as_str().unwrap());
+        match c["next_offset"].as_u64() {
+            Some(n) => {
+                assert!(n > offset);
+                offset = n;
+            }
+            None => return (out, c.clone()),
+        }
+    }
+}
+
+#[test]
+fn history_keeps_raw_text_and_pages_through_large_content() {
+    let mut kb = kb();
+    let alice = user("alice");
+    let raw = "  前回の依頼は取り消し🙏\r\n\t東京タワーの件で。 \n";
+    let r = w(
+        &mut kb,
+        &alice,
+        json!({ "op": "record_event", "event_id": "e1", "conversation": "c1", "sequence": 1, "kind": "message", "origin": "human", "api_role": "user",
+                "received_at": "2026-09-22T10:00:00Z", "content": raw }),
+    );
+    assert_eq!(r["duplicate"], false);
+    assert_eq!(r["owner"], "alice");
+    let g = hq(&kb, &alice, json!({ "op": "history_get", "event": "e1" }));
+    assert_eq!(g["content"]["text"], raw);
+    assert_eq!(g["content"]["next_offset"], Value::Null);
+    assert_eq!(g["content"]["content_hash"], g["event"]["content_hash"]);
+    assert_eq!(g["event"]["origin"], "human");
+    assert_eq!(g["event"]["size"], raw.len());
+
+    // 64 KiB を超える多バイト文字の本文を、半端な長さのページでも欠落なく復元できる。
+    let big: String = (0..30_000).map(|i| ["あ", "😀", "a", "\n", "漢"][i % 5]).collect();
+    assert!(big.len() > 64 * 1024);
+    record(&mut kb, &alice, vec![event("e2", "c1", 2, "tool_result", "tool", &big)]);
+    let (text, last) = read_all(&kb, &alice, "e2", 1001);
+    assert_eq!(text, big);
+    assert_eq!(last["total_size"], big.len());
+    let (text, _) = read_all(&kb, &alice, "e2", 64 * 1024);
+    assert_eq!(text, big);
+    // 既定のページでは打ち切りを明示し、続きの位置を返す。
+    let g = hq(&kb, &alice, json!({ "op": "history_get", "event": "e2" }));
+    assert!(g["content"]["next_offset"].as_u64().unwrap() <= 64 * 1024);
+    // 文字の途中からは読ませない（base64 なら任意の位置から読める）。
+    let e = kb.query_json(&alice, &json!({ "op": "history_get", "budget_ms": 100, "event": "e2", "offset": 4 }).to_string()).unwrap_err();
+    assert_eq!(e.code(), "invalid");
+    let b = hq(&kb, &alice, json!({ "op": "history_get", "event": "e2", "offset": 4, "length": 3, "encoding": "base64" }));
+    // "あ" の後の "😀"（F0 9F 98 80）の 2 バイト目から。
+    assert_eq!(b["content"]["base64"], "n5iA");
+
+    // get_acquisition もページ単位で最後まで読める（所有者本人は非公開の会話を読める）。
+    let acq = g["event"]["acquisition"].as_str().unwrap().to_string();
+    let mut offset = 0;
+    let mut joined = String::new();
+    loop {
+        let a = hq(
+            &kb,
+            &alice,
+            json!({ "op": "get_acquisition", "acquisition": acq, "include_snapshot": true, "snapshot_offset": offset, "snapshot_length": 50_000 }),
+        );
+        let s = &a["snapshot"];
+        assert_eq!(s["license"], "unknown");
+        joined.push_str(s["content"].as_str().unwrap());
+        match s["next_offset"].as_u64() {
+            Some(n) => offset = n,
+            None => break,
+        }
+    }
+    assert_eq!(joined, big);
+
+    // UTF-8 でない本文は base64 で返し、本文検索できないことを示す。
+    record(
+        &mut kb,
+        &alice,
+        vec![
+            json!({ "event_id": "bin", "conversation": "c1", "sequence": 3, "kind": "attachment", "origin": "human", "content_base64": "/wAB", "media_type": "application/octet-stream" }),
+        ],
+    );
+    let g = hq(&kb, &alice, json!({ "op": "history_get", "event": "bin" }));
+    assert_eq!(g["content"]["encoding"], "base64");
+    assert_eq!(g["content"]["base64"], "/wAB");
+    assert_eq!(g["event"]["text_indexed"], false);
+    let s = q(&kb, &alice, json!({ "op": "history_search", "budget_ms": 500, "text": "東京" }));
+    assert!(s["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("could not be searched")));
+}
+
+#[test]
+fn history_records_are_idempotent_by_event_id() {
+    let mut kb = kb();
+    let alice = user("alice");
+    let first = record(&mut kb, &alice, vec![event("e1", "c1", 1, "message", "human", "はい"), event("e2", "c1", 2, "message", "model", "了解")]);
+    assert_eq!(first["recorded"], 2);
+    let revs = kb.revisions().len();
+    // 応答が失われた後の再送: 新しいイベントも Revision も増えない。
+    let again = record(&mut kb, &alice, vec![event("e1", "c1", 1, "message", "human", "はい"), event("e2", "c1", 2, "message", "model", "了解")]);
+    assert_eq!(again["recorded"], 0);
+    assert_eq!(again["events"][0]["duplicate"], true);
+    assert_eq!(again["events"][0]["acquisition"], first["events"][0]["acquisition"]);
+    assert_eq!(kb.revisions().len(), revs);
+    // 同じ ID で内容や記録順が違えば衝突。
+    assert_eq!(w_err(&mut kb, &alice, json!({ "op": "record_events", "events": [event("e1", "c1", 1, "message", "human", "いいえ")] })).code(), "conflict");
+    assert_eq!(w_err(&mut kb, &alice, json!({ "op": "record_events", "events": [event("e1", "c1", 1, "message", "runtime", "はい")] })).code(), "conflict");
+    // 別 ID が同じ記録順を使うのも衝突。
+    assert_eq!(w_err(&mut kb, &alice, json!({ "op": "record_events", "events": [event("e9", "c1", 2, "message", "human", "x")] })).code(), "conflict");
+    // 送信側のハッシュと一致しない本文は受け付けない。
+    let e = w_err(
+        &mut kb,
+        &alice,
+        json!({ "op": "record_event", "event_id": "e3", "conversation": "c1", "sequence": 3, "kind": "message", "origin": "human", "content": "a", "content_hash": "blake3:00" }),
+    );
+    assert_eq!(e.code(), "invalid");
+    // 同じ本文でも ID が違えば両方残る（同文の別発言）。
+    let r = record(&mut kb, &alice, vec![event("e3", "c1", 3, "message", "human", "はい"), event("e3", "c1", 3, "message", "human", "はい")]);
+    assert_eq!(r["recorded"], 1);
+    assert_eq!(r["events"][1]["duplicate"], true);
+    let s = hq(&kb, &alice, json!({ "op": "history_search", "text": "はい", "order": "oldest" }));
+    let ids: Vec<&str> = s["events"].as_array().unwrap().iter().map(|e| e["event_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["e1", "e3"]);
+    // 匿名の主体は履歴を記録できない。
+    assert_eq!(
+        w_err(&mut kb, &Principal::anonymous(), json!({ "op": "record_events", "events": [event("x", "c", 1, "message", "human", "a")] })).code(),
+        "forbidden"
+    );
+}
+
+#[test]
+fn history_distinguishes_origins_and_links_tool_calls() {
+    let mut kb = kb();
+    let alice = user("alice");
+    let mut cont = event("e2", "c1", 2, "message", "runtime", "続けてください");
+    cont["api_role"] = json!("user");
+    let mut call_a = event("e4", "c1", 4, "tool_call", "model", r#"{"cmd":"ls"}"#);
+    call_a["call_id"] = json!("call-a");
+    let mut call_b = event("e5", "c1", 5, "tool_call", "model", r#"{"cmd":"rm -rf build"}"#);
+    call_b["call_id"] = json!("call-b");
+    let mut res_b = event("e6", "c1", 6, "tool_result", "tool", "removed");
+    res_b["call_id"] = json!("call-b");
+    res_b["status"] = json!("ok");
+    let mut res_a = event("e7", "c1", 7, "tool_result", "tool", "");
+    res_a["call_id"] = json!("call-a");
+    res_a["status"] = json!("interrupted");
+    let mut fix = event("e8", "c1", 8, "message", "human", "さっきの依頼は取り消して、ビルドは残して");
+    fix["supersedes"] = json!("e1");
+    record(
+        &mut kb,
+        &alice,
+        vec![
+            event("e1", "c1", 1, "message", "human", "ビルドを消して"),
+            cont,
+            event("e3", "c1", 3, "message", "model", "消します"),
+            call_a,
+            call_b,
+            res_b,
+            res_a,
+            fix,
+        ],
+    );
+    // ユーザー本人の発言だけを探す（API 上 role: user の自動継続指示は含めない）。
+    let s = hq(&kb, &alice, json!({ "op": "history_search", "origins": ["human"], "order": "sequence", "conversation": "c1" }));
+    let ids: Vec<&str> = s["events"].as_array().unwrap().iter().map(|e| e["event_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["e1", "e8"]);
+    let s = hq(&kb, &alice, json!({ "op": "history_search", "text": "続けて" }));
+    assert_eq!(s["events"][0]["origin"], "runtime");
+    assert_eq!(s["events"][0]["api_role"], "user");
+    // 並行した呼び出しと結果の対応、中断の状態、訂正の関係。
+    let g = hq(&kb, &alice, json!({ "op": "history_get", "event": "e4" }));
+    assert_eq!(g["related"]["call"][0]["event_id"], "e7");
+    assert_eq!(g["related"]["call"][0]["status"], "interrupted");
+    let g = hq(&kb, &alice, json!({ "op": "history_get", "event": "e1" }));
+    assert_eq!(g["event"]["superseded_by"], json!(["e8"]));
+    assert_eq!(g["related"]["superseded_by"][0]["event_id"], "e8");
+    // 前後の会話を記録順で確認する。
+    let c = hq(&kb, &alice, json!({ "op": "history_context", "event": "e5", "before": 2, "after": 1 }));
+    let seqs: Vec<u64> = c["events"].as_array().unwrap().iter().map(|e| e["sequence"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, vec![3, 4, 5, 6]);
+    assert_eq!(c["has_more_before"], true);
+    assert_eq!(c["has_more_after"], true);
+    assert_eq!(c["events"][1]["content"]["text"], r#"{"cmd":"ls"}"#);
+    // 会話だけを指定すると末尾から。
+    let c = hq(&kb, &alice, json!({ "op": "history_context", "conversation": "c1", "before": 2, "max_content_bytes": 0 }));
+    let seqs: Vec<u64> = c["events"].as_array().unwrap().iter().map(|e| e["sequence"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, vec![7, 8]);
+    assert!(c["events"][0].get("content").is_none());
+}
+
+#[test]
+fn history_search_matches_substrings_and_pages_with_cursor() {
+    let mut kb = kb();
+    let alice = user("alice");
+    let events: Vec<Value> = (1..=25)
+        .map(|i| {
+            let mut e = event(&format!("e{i}"), "c1", i, "message", "human", &format!("{i} 番目: Deploy the mainline build。東京タワー"));
+            e["received_at"] = json!(format!("2026-09-01T00:{:02}:00Z", i));
+            e
+        })
+        .collect();
+    record(&mut kb, &alice, events);
+    record(&mut kb, &alice, vec![event("other", "c2", 1, "message", "human", "京都に行く")]);
+    for q in ["ploy", "MAINL", "京タワ", "タワー mainline", "ｄｅｐｌｏｙ"] {
+        let s = hq(&kb, &alice, json!({ "op": "history_search", "text": q, "limit": 1 }));
+        assert_eq!(s["events"].as_array().unwrap().len(), 1, "{q}");
+        assert_eq!(s["events"][0]["event_id"], "e25", "{q}");
+    }
+    let s = hq(&kb, &alice, json!({ "op": "history_search", "text": "京都" }));
+    assert_eq!(s["events"][0]["event_id"], "other");
+    let m = &s["events"][0];
+    assert_eq!(m["excerpt"]["text"], "京都に行く");
+    assert_eq!(m["match"], json!({ "unit": "byte", "start": 0, "end": 6 }));
+    // 完全一致は原文の表記で照合する。
+    assert_eq!(hq(&kb, &alice, json!({ "op": "history_search", "text": "deploy", "exact": true }))["events"].as_array().unwrap().len(), 0);
+    assert_eq!(hq(&kb, &alice, json!({ "op": "history_search", "text": "Deploy the", "exact": true, "limit": 100 }))["events"].as_array().unwrap().len(), 25);
+    // カーソルで取りこぼし・重複なく全件をたどれる。
+    let mut seen = vec![];
+    let mut cursor = Value::Null;
+    loop {
+        let s = hq(&kb, &alice, json!({ "op": "history_search", "text": "タワー", "limit": 7, "cursor": cursor, "conversation": "c1" }));
+        seen.extend(s["events"].as_array().unwrap().iter().map(|e| e["sequence"].as_u64().unwrap()));
+        if s["has_more"] == false {
+            break;
+        }
+        cursor = s["next_cursor"].clone();
+    }
+    assert_eq!(seen, (1..=25).rev().collect::<Vec<u64>>());
+    // 期間での絞り込み（受信時刻）。
+    let s = hq(&kb, &alice, json!({ "op": "history_search", "from": "2026-09-01T00:10:00Z", "to": "2026-09-01T00:12:00Z", "order": "oldest" }));
+    let seqs: Vec<u64> = s["events"].as_array().unwrap().iter().map(|e| e["sequence"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, vec![10, 11]);
+    // 会話の一覧から同期済みの位置が分かる。
+    let l = hq(&kb, &alice, json!({ "op": "history_conversations" }));
+    assert_eq!(l["total"], 2);
+    let c1 = l["conversations"].as_array().unwrap().iter().find(|c| c["conversation"] == "c1").unwrap();
+    assert_eq!(c1["last_sequence"], 25);
+    assert_eq!(c1["missing_sequences"], 0);
+    assert_eq!(c1["visibility"]["level"], "private");
+}
+
+#[test]
+fn history_is_visible_only_to_its_owner_and_delegates() {
+    let mut kb = kb();
+    let alice = user("alice");
+    let bob = user("bob");
+    let r = record(&mut kb, &alice, vec![event("e1", "c1", 1, "message", "human", "私の住所は秘密です")]);
+    let acq = r["events"][0]["acquisition"].as_str().unwrap().to_string();
+    // 別のユーザーは、検索・イベント ID・会話・Acquisition ID のどこからも取得できない。
+    assert!(hq(&kb, &bob, json!({ "op": "history_search", "text": "住所" }))["events"].as_array().unwrap().is_empty());
+    assert!(hq(&kb, &bob, json!({ "op": "history_search", "text": "住所", "owner": "alice" }))["events"].as_array().unwrap().is_empty());
+    for body in [
+        json!({ "op": "history_get", "event": "e1", "budget_ms": 100 }),
+        json!({ "op": "history_get", "event": "e1", "owner": "alice", "budget_ms": 100 }),
+        json!({ "op": "history_context", "conversation": "c1", "owner": "alice", "budget_ms": 100 }),
+        json!({ "op": "get_acquisition", "acquisition": acq, "include_snapshot": true, "budget_ms": 100 }),
+    ] {
+        for p in [&bob, &Principal::curator("carol"), &Principal::anonymous()] {
+            let e = kb.query_json(p, &body.to_string()).unwrap_err();
+            assert_eq!(e.code(), "not_found", "{body} as {}", p.actor.id);
+        }
+    }
+    assert!(hq(&kb, &bob, json!({ "op": "history_conversations", "owner": "alice" }))["conversations"].as_array().unwrap().is_empty());
+    // 他人の非公開の取得記録を根拠として参照させない。
+    let ev = create(&mut kb, &["Event"], "何か");
+    let e = w_err(
+        &mut kb,
+        &bob,
+        json!({ "op": "propose_assertion", "subject": ev, "predicate": "name", "object": { "text": "x" }, "evidence": [{ "acquisition": acq }] }),
+    );
+    assert_eq!(e.code(), "forbidden");
+    // 同じ会話 ID でも所有者ごとに別の会話になる。
+    record(&mut kb, &bob, vec![event("e1", "c1", 1, "message", "human", "bob の発言")]);
+    assert_eq!(hq(&kb, &bob, json!({ "op": "history_get", "event": "e1" }))["content"]["text"], "bob の発言");
+    assert_eq!(hq(&kb, &alice, json!({ "op": "history_get", "event": "e1" }))["content"]["text"], "私の住所は秘密です");
+
+    // 委任されたエージェントは所有者の履歴を読み書きできるが、キュレーターにはならない。
+    let delegate = Principal::delegated("assistant-1", "alice");
+    let g = hq(&kb, &delegate, json!({ "op": "history_get", "event": "e1" }));
+    assert_eq!(g["content"]["text"], "私の住所は秘密です");
+    let a = hq(&kb, &delegate, json!({ "op": "get_acquisition", "acquisition": acq, "include_snapshot": true }));
+    assert_eq!(a["snapshot"]["content"], "私の住所は秘密です");
+    assert_eq!(a["snapshot"]["redistributable"], false);
+    let r = record(&mut kb, &delegate, vec![event("e2", "c1", 2, "message", "model", "承知しました")]);
+    assert_eq!(r["owner"], "alice");
+    let g = hq(&kb, &alice, json!({ "op": "history_get", "event": "e2" }));
+    assert_eq!(g["event"]["recorded_by"]["id"], "assistant-1");
+    assert_eq!(
+        w_err(&mut kb, &delegate, json!({ "op": "define_license", "license": { "key": "x", "name": "x", "redistributable": true } })).code(),
+        "forbidden"
+    );
+    // 他人を所有者にした非公開データは作れない。
+    let e = w_err(
+        &mut kb,
+        &bob,
+        json!({ "op": "record_event", "event_id": "z", "conversation": "c9", "sequence": 1, "kind": "message", "origin": "human", "content": "a", "visibility": { "level": "private", "owner": "alice" } }),
+    );
+    assert_eq!(e.code(), "forbidden");
+}
+
+#[test]
+fn private_sources_are_scoped_to_their_owner() {
+    let mut kb = kb();
+    let alice = user("alice");
+    let bob = user("bob");
+    let private = |who: &str| json!({ "visibility": { "level": "private", "owner": who } });
+    let url = "https://intranet.example/doc";
+    let body = |extra: Value| {
+        let mut b = json!({ "op": "link_source", "url": url, "acquisition": { "acquired_at": "2026-09-01T00:00:00Z", "content": "社外秘" } });
+        if let (Value::Object(m), Value::Object(e)) = (&mut b, extra) {
+            m.extend(e);
+        }
+        b
+    };
+    let a1 = w(&mut kb, &alice, body(private("alice")));
+    let b1 = w(&mut kb, &bob, body(private("bob")));
+    let pub1 = w(&mut kb, &alice, body(json!({})));
+    // 同じ URL でも所有者・公開ごとに別の Source。
+    assert_ne!(a1["source"], b1["source"]);
+    assert_ne!(a1["source"], pub1["source"]);
+    assert_eq!(w(&mut kb, &alice, body(private("alice")))["source"], a1["source"]);
+    // 非公開の Source は所有者だけが本文を読める（公開 Source はライセンスどおり伏せる）。
+    let get = |p: &Principal, acq: &Value| {
+        kb.query_json(p, &json!({ "op": "get_acquisition", "budget_ms": 100, "acquisition": acq, "include_snapshot": true }).to_string())
+    };
+    assert_eq!(serde_json::to_value(get(&alice, &a1["acquisition"]).unwrap()).unwrap()["results"]["snapshot"]["content"], "社外秘");
+    assert_eq!(get(&bob, &a1["acquisition"]).unwrap_err().code(), "not_found");
+    let p = serde_json::to_value(get(&alice, &pub1["acquisition"]).unwrap()).unwrap();
+    assert!(p["results"]["snapshot"]["withheld"].is_string());
+    // 他人の非公開 Source を ID 指定して取得記録を足すこともできない。
+    let src = a1["source"].as_str().unwrap();
+    let e = w_err(&mut kb, &bob, json!({ "op": "link_source", "source": src, "acquisition": { "acquired_at": "2026-09-02T00:00:00Z", "content": "x" } }));
+    assert_eq!(e.code(), "forbidden");
+}
+
+#[test]
+fn shredded_history_is_removed_from_the_text_index() {
+    let mut kb = kb();
+    let alice = user("alice");
+    let key = w(&mut kb, &alice, json!({ "op": "create_key" }))["key_id"].as_str().unwrap().to_string();
+    let mut e = event("e1", "c1", 1, "message", "human", "削除してほしい個人情報");
+    e["encrypt_with"] = json!(key);
+    record(&mut kb, &alice, vec![e.clone()]);
+    assert_eq!(hq(&kb, &alice, json!({ "op": "history_search", "text": "個人情報" }))["events"].as_array().unwrap().len(), 1);
+    // 暗号化した本文も、再送の同一性は復号して確かめる。
+    assert_eq!(record(&mut kb, &alice, vec![e.clone()])["events"][0]["duplicate"], true);
+    w(&mut kb, &curator(), json!({ "op": "shred_key", "key_id": key }));
+    assert!(hq(&kb, &alice, json!({ "op": "history_search", "text": "個人情報" }))["events"].as_array().unwrap().is_empty());
+    let g = hq(&kb, &alice, json!({ "op": "history_get", "event": "e1" }));
+    assert_eq!(g["content"]["withheld"], "content key has been shredded");
+    assert_eq!(g["event"]["text_indexed"], false);
+    // メタデータ（記録順・生成元）は残る。
+    assert_eq!(g["event"]["origin"], "human");
+}
+
+#[test]
+fn history_survives_restart_and_a_torn_log_tail() {
+    let dir = std::env::temp_dir().join(format!("chronotope-history-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let alice = user("alice");
+    let big: String = "長い本文。".repeat(20_000);
+    {
+        let mut kb = KnowledgeBase::open(&dir, KbConfig::default()).unwrap();
+        record(&mut kb, &alice, vec![event("e1", "c1", 1, "message", "human", " 最初の依頼 \n"), event("e2", "c1", 2, "tool_result", "tool", &big)]);
+    }
+    // 書き込み途中で落ちた Revision（末尾の改行の無い行）。
+    let log = dir.join("revisions.jsonl");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    std::io::Write::write_all(&mut f, br#"{"id":"rev_0192","seq":99,"#).unwrap();
+    drop(f);
+    {
+        let mut kb = KnowledgeBase::open(&dir, KbConfig::default()).unwrap();
+        assert_eq!(hq(&kb, &alice, json!({ "op": "history_get", "event": "e1" }))["content"]["text"], " 最初の依頼 \n");
+        let (text, _) = read_all(&kb, &alice, "e2", 64 * 1024);
+        assert_eq!(text, big);
+        assert_eq!(hq(&kb, &alice, json!({ "op": "history_search", "text": "最初の依頼" }))["events"][0]["event_id"], "e1");
+        // 回復後も追記できる。
+        record(&mut kb, &alice, vec![event("e3", "c1", 3, "message", "human", "次")]);
+    }
+    let kb = KnowledgeBase::open(&dir, KbConfig::default()).unwrap();
+    let c = hq(&kb, &alice, json!({ "op": "history_context", "event": "e2", "before": 5, "after": 5, "max_content_bytes": 16 }));
+    let seqs: Vec<u64> = c["events"].as_array().unwrap().iter().map(|e| e["sequence"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, vec![1, 2, 3]);
+    assert!(c["events"][1]["content"]["next_offset"].is_u64());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn history_context_reports_sequence_gaps() {
+    let mut kb = kb();
+    let alice = user("alice");
+    record(&mut kb, &alice, vec![event("e1", "c1", 1, "message", "human", "a"), event("e4", "c1", 4, "message", "human", "b")]);
+    let r = q(&kb, &alice, json!({ "op": "history_context", "budget_ms": 100, "event": "e1", "after": 3 }));
+    assert_eq!(r["results"]["gaps"], json!([{ "from": 2, "to": 3 }]));
+    assert!(!r["warnings"].as_array().unwrap().is_empty());
+    let l = hq(&kb, &alice, json!({ "op": "history_conversations" }));
+    assert_eq!(l["conversations"][0]["missing_sequences"], 2);
+}

@@ -24,6 +24,8 @@ pub enum SourceKind {
     Table,
     Sensor,
     Human,
+    /// 会話（エージェントとのやり取り）。発言・ツール実行を Acquisition として持つ。
+    Conversation,
     Other,
 }
 
@@ -78,6 +80,16 @@ pub enum Locator {
     Opaque {
         value: String,
     },
+    /// 会話全体（所有者の範囲内で一意な会話 ID）。
+    Conversation {
+        conversation: String,
+    },
+    /// 会話内の 1 イベント（発言・ツール呼び出し・結果など）。
+    ConversationEvent {
+        conversation: String,
+        event: String,
+        sequence: u64,
+    },
 }
 
 impl Locator {
@@ -85,6 +97,18 @@ impl Locator {
         match self {
             Locator::Url { url } => url.clone(),
             other => serde_json::to_string(other).unwrap_or_default(),
+        }
+    }
+
+    /// 同じ位置指定子の Source を探すためのキー。非公開の Source は可視範囲ごとに分け、
+    /// 別の所有者・グループの Source へ取得記録を追加できないようにする。
+    pub fn scoped_key(&self, visibility: &Visibility) -> String {
+        match visibility {
+            Visibility::Public => self.key(),
+            Visibility::Private { owner } => format!("private:{owner}\u{0}{}", self.key()),
+            Visibility::Groups { groups } => {
+                format!("groups:{}\u{0}{}", groups.iter().cloned().collect::<Vec<_>>().join(","), self.key())
+            }
         }
     }
 }
@@ -138,6 +162,10 @@ pub struct Source {
 impl Source {
     pub fn root(&self) -> SourceId {
         self.provenance_root.unwrap_or(self.id)
+    }
+
+    pub fn lookup_key(&self) -> String {
+        self.locator.scoped_key(&self.visibility)
     }
 }
 

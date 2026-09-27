@@ -253,10 +253,11 @@ impl KnowledgeBase {
                 "license",
                 "visibility_level",
                 "visibility_groups",
+                "visibility_owner",
                 "registered_at",
             ],
             st.sources.values().map(|x| {
-                let (l, g, _) = vis(&x.visibility);
+                let (l, g, o) = vis(&x.visibility);
                 vec![
                     uuid(&x.id.0),
                     json(&x.kind).map(|k| k.trim_matches('"').to_string()),
@@ -271,6 +272,7 @@ impl KnowledgeBase {
                     x.license.clone(),
                     l,
                     g,
+                    o,
                     tick(x.registered_at),
                 ]
             }),
@@ -329,6 +331,69 @@ impl KnowledgeBase {
                     tick(d.extracted_at),
                     d.extraction_conf.map(|x| x.to_string()),
                 ])
+            }),
+        )
+        .map_err(io)?;
+        let enum_s = |v: Option<String>| v.map(|k| k.trim_matches('"').to_string());
+        c.table(
+            "conversation_event",
+            &[
+                "source_id",
+                "owner_id",
+                "event_id",
+                "conversation_id",
+                "turn_id",
+                "sequence",
+                "kind",
+                "origin",
+                "api_role",
+                "speaker",
+                "received_at",
+                "recorded_at",
+                "recorded_by",
+                "response_id",
+                "call_id",
+                "parent_event_id",
+                "status",
+                "supersedes",
+                "derived_from",
+                "metadata",
+                "acquisition_id",
+                "size",
+                "visibility_level",
+                "visibility_groups",
+                "visibility_owner",
+            ],
+            self.history.iter().map(|e| {
+                let f = &e.fields;
+                let (l, g, o) = st.sources.get(&e.source).map(|x| vis(&x.visibility)).unwrap_or_else(|| vis(&Visibility::Private { owner: e.owner.clone() }));
+                vec![
+                    uuid(&e.source.0),
+                    s(&e.owner),
+                    s(&e.event_id),
+                    s(&f.conversation),
+                    f.turn.clone(),
+                    s(f.sequence),
+                    enum_s(json(&f.kind)),
+                    enum_s(json(&f.origin)),
+                    f.api_role.clone(),
+                    f.speaker.clone(),
+                    f.received_at.and_then(tick),
+                    tick(e.recorded_at),
+                    s(&e.recorded_by.id),
+                    f.response_id.clone(),
+                    f.call_id.clone(),
+                    f.parent_event.clone(),
+                    enum_s(f.status.as_ref().and_then(json)),
+                    f.supersedes.clone(),
+                    text_arr(f.derived_from.iter()),
+                    f.metadata.as_ref().and_then(json),
+                    uuid(&e.acquisition.0),
+                    s(e.size),
+                    l,
+                    g,
+                    o,
+                ]
             }),
         )
         .map_err(io)?;

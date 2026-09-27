@@ -55,6 +55,7 @@ pub struct CanonicalStore {
     pub overrides: HashMap<AssertionId, Vec<AssertionId>>,
 
     pub sources: HashMap<SourceId, Source>,
+    /// [`Source::lookup_key`]（非公開の Source は可視範囲ごとに別キー）→ Source。
     pub source_by_locator: HashMap<String, SourceId>,
     pub sources_by_resource: HashMap<ResourceId, Vec<SourceId>>,
     pub acquisitions: HashMap<AcquisitionId, Acquisition>,
@@ -363,7 +364,7 @@ impl CanonicalStore {
                 self.assertion_touch(&a)
             }
             Command::RegisterSource { source } => {
-                self.source_by_locator.insert(source.locator.key(), source.id);
+                self.source_by_locator.insert(source.lookup_key(), source.id);
                 if let Some(r) = source.resource {
                     self.sources_by_resource.entry(r).or_default().push(source.id);
                 }
@@ -427,7 +428,8 @@ impl CanonicalStore {
             | Command::AddTrajectory { .. }
             | Command::AddTableRows { .. }
             | Command::DefineEmbeddingSpace { .. }
-            | Command::SetEmbedding { .. } => {
+            | Command::SetEmbedding { .. }
+            | Command::RecordEvent { .. } => {
                 let _ = rev;
                 Touch::default()
             }

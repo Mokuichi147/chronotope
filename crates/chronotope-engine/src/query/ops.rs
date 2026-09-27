@@ -1,7 +1,9 @@
 //! search 以外の読み取り操作。
 
+use super::history::{ContentEncoding, content_page};
 use super::render::{time_json, unresolved_json};
 use super::{Direction, QCtx};
+use crate::history::Unindexed;
 use crate::projection::ProjectionRow;
 use crate::store::columnar::ObservationStore;
 use crate::view::{StatusSet, View};
@@ -219,46 +221,51 @@ pub(super) fn expand_claims(
     Ok(out)
 }
 
-fn snapshot_json(ctx: &QCtx, acq: &Acquisition, source: Option<&Source>, include: bool) -> Json {
-    let Some(r) = &acq.snapshot_ref else { return Json::Null };
+/// `get_acquisition` のスナップショット本文の範囲。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SnapshotPage {
+    pub offset: u64,
+    pub length: Option<u64>,
+    pub encoding: ContentEncoding,
+}
+
+fn snapshot_json(ctx: &QCtx, acq: &Acquisition, source: Option<&Source>, page: Option<SnapshotPage>) -> Result<Json> {
+    let Some(r) = &acq.snapshot_ref else { return Ok(Json::Null) };
     let s = &ctx.kb.store;
     let license = source.and_then(|x| x.license.clone()).unwrap_or_else(|| "unknown".into());
     let redistributable = s.licenses.get(&license).is_some_and(|l| l.redistributable);
     let mut j = json!({ "ref": r, "license": license, "redistributable": redistributable });
-    if !include {
-        return j;
-    }
-    if !redistributable && !(ctx.principal.curator && !ctx.principal.actor.is_ai()) {
+    let Some(page) = page else { return Ok(j) };
+    // 非公開の Source（所有者・グループだけが見える会話など）は、閲覧できる主体にだけ本文を返す。
+    // 再配布ではないため、読むためにライセンスを付け替える必要はない。
+    let scoped = source.is_some_and(|x| !x.visibility.is_public() && ctx.principal.can_see(&x.visibility));
+    if !redistributable && !scoped && !(ctx.principal.curator && !ctx.principal.actor.is_ai()) {
         j["withheld"] = json!("the source license does not permit redistribution");
-        return j;
+        return Ok(j);
     }
-    match ctx.kb.objects.get(&r.hash) {
-        Ok(Some(bytes)) => {
-            let plain = match r.encrypted_with {
-                Some(k) if bytes.len() > 12 => ctx.kb.vault.decrypt_bytes(&k, &hex::encode(&bytes[..12]), &bytes[12..]),
-                Some(_) => None,
-                None => Some(bytes),
-            };
-            match plain {
-                Some(b) => {
-                    const MAX: usize = 64 * 1024;
-                    let cut = &b[..b.len().min(MAX)];
-                    j["content"] = json!(String::from_utf8_lossy(cut));
-                    j["content_truncated"] = json!(b.len() > MAX);
-                }
-                None => j["withheld"] = json!("snapshot key has been shredded"),
+    match ctx.kb.read_snapshot(r)? {
+        Ok(bytes) => {
+            let p = content_page(&bytes, page.offset, page.length, page.encoding)?;
+            match p.get("text") {
+                Some(t) => j["content"] = t.clone(),
+                None => j["content_base64"] = p["base64"].clone(),
             }
+            j["encoding"] = p["encoding"].clone();
+            j["range"] = p["range"].clone();
+            j["total_size"] = p["total_size"].clone();
+            j["next_offset"] = p["next_offset"].clone();
+            j["content_truncated"] = json!(!p["next_offset"].is_null() || page.offset > 0);
         }
-        Ok(None) => j["withheld"] = json!("snapshot object missing"),
-        Err(e) => j["withheld"] = json!(e.to_string()),
+        Err(Unindexed::Shredded) => j["withheld"] = json!("snapshot key has been shredded"),
+        Err(why) => j["withheld"] = json!(why.as_str()),
     }
-    j
+    Ok(j)
 }
 
-fn acquisition_json(ctx: &QCtx, acq: &Acquisition, derivation: Option<&Derivation>, include_snapshot: bool) -> Json {
+fn acquisition_json(ctx: &QCtx, acq: &Acquisition, derivation: Option<&Derivation>, page: Option<SnapshotPage>) -> Result<Json> {
     let s = &ctx.kb.store;
     let source = s.sources.get(&acq.source).filter(|x| ctx.principal.can_see(&x.visibility));
-    json!({
+    Ok(json!({
         "acquisition": {
             "id": acq.id,
             "acquired_at": acq.acquired_at.to_iso(),
@@ -279,6 +286,7 @@ fn acquisition_json(ctx: &QCtx, acq: &Acquisition, derivation: Option<&Derivatio
             "provenance_root": x.root(),
             "is_reprint": x.provenance_root.is_some(),
             "license": x.license,
+            "visibility": x.visibility,
             "resource": x.resource,
         })),
         "derivation": derivation.map(|d| json!({
@@ -291,11 +299,16 @@ fn acquisition_json(ctx: &QCtx, acq: &Acquisition, derivation: Option<&Derivatio
             "extracted_at": d.extracted_at.to_iso(),
             "extraction_conf": d.extraction_conf,
         })),
-        "snapshot": snapshot_json(ctx, acq, source, include_snapshot),
-    })
+        "snapshot": snapshot_json(ctx, acq, source, page)?,
+    }))
 }
 
-pub(super) fn get_acquisition(ctx: &QCtx, assertion: Option<AssertionId>, acquisition: Option<AcquisitionId>, include_snapshot: bool) -> Result<Json> {
+/// 取得記録の Source を閲覧できるか（Source が無い古い記録は公開扱い）。
+fn acquisition_visible(ctx: &QCtx, acq: &Acquisition) -> bool {
+    ctx.kb.store.sources.get(&acq.source).is_none_or(|x| ctx.principal.can_see(&x.visibility))
+}
+
+pub(super) fn get_acquisition(ctx: &QCtx, assertion: Option<AssertionId>, acquisition: Option<AcquisitionId>, page: Option<SnapshotPage>) -> Result<Json> {
     let s = &ctx.kb.store;
     match (assertion, acquisition) {
         (Some(aid), _) => {
@@ -303,15 +316,16 @@ pub(super) fn get_acquisition(ctx: &QCtx, assertion: Option<AssertionId>, acquis
             if !ctx.principal.can_see(&a.visibility) {
                 return Err(Error::forbidden("assertion is not visible to this principal"));
             }
-            let ev: Vec<Json> = a
-                .evidence
-                .iter()
-                .filter_map(|e| {
-                    let acq = s.acquisitions.get(&e.acquisition)?;
-                    let d = e.derivation.and_then(|d| s.derivations.get(&d));
-                    Some(acquisition_json(ctx, acq, d, include_snapshot))
-                })
-                .collect();
+            let mut ev = vec![];
+            for e in &a.evidence {
+                let Some(acq) = s.acquisitions.get(&e.acquisition) else { continue };
+                if !acquisition_visible(ctx, acq) {
+                    ev.push(json!({ "withheld": "the evidence comes from a source that is not visible to this principal" }));
+                    continue;
+                }
+                let d = e.derivation.and_then(|d| s.derivations.get(&d));
+                ev.push(acquisition_json(ctx, acq, d, page)?);
+            }
             let mut out = json!({ "assertion": ctx.claim_json(a, a.status, None), "evidence": ev });
             if a.evidence.is_empty() {
                 out["note"] = json!(format!("asserted directly by {} without an acquisition", a.asserted_by.id));
@@ -319,8 +333,8 @@ pub(super) fn get_acquisition(ctx: &QCtx, assertion: Option<AssertionId>, acquis
             Ok(out)
         }
         (None, Some(qid)) => {
-            let acq = s.acquisitions.get(&qid).ok_or_else(|| Error::not_found(format!("acquisition {qid}")))?;
-            Ok(acquisition_json(ctx, acq, None, include_snapshot))
+            let acq = s.acquisitions.get(&qid).filter(|a| acquisition_visible(ctx, a)).ok_or_else(|| Error::not_found(format!("acquisition {qid}")))?;
+            acquisition_json(ctx, acq, None, page)
         }
         _ => Err(Error::invalid("get_acquisition needs `assertion` or `acquisition`")),
     }

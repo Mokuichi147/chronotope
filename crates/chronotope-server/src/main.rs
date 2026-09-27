@@ -37,6 +37,12 @@ enum Cmd {
         /// デモデータを投入してから起動する（in-memory 時のみ）。
         #[arg(long)]
         seed_demo: bool,
+        /// リクエスト本文の上限（バイト）。
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        max_body_bytes: usize,
+        /// 書き込みごとの fsync を省く（電源断で直前の書き込みを失ってよい開発用）。
+        #[arg(long)]
+        no_fsync: bool,
     },
     /// 合成データで Tier 0 / Tier 1 のレイテンシを測定する。
     Bench {
@@ -117,15 +123,15 @@ fn main() -> anyhow_like::Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { data, addr, in_memory, materialize_interval_ms, materialize_batch, seed_demo } => {
-            let config = KbConfig { materialize_batch, ..KbConfig::default() };
+        Cmd::Serve { data, addr, in_memory, materialize_interval_ms, materialize_batch, seed_demo, max_body_bytes, no_fsync } => {
+            let config = KbConfig { materialize_batch, fsync: !no_fsync, ..KbConfig::default() };
             let mut kb = if in_memory { KnowledgeBase::in_memory(config) } else { KnowledgeBase::open(&data, config)? };
             if seed_demo {
                 demo::seed(&mut kb)?;
             }
             kb.materialize_all()?;
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            rt.block_on(http::serve(kb, &addr, materialize_interval_ms))?;
+            rt.block_on(http::serve(kb, &addr, materialize_interval_ms, max_body_bytes))?;
         }
         Cmd::Bench { events, queries, seed, export_sql } => bench::run(events, queries, seed, export_sql)?,
         Cmd::ExportSql { data, demo, branch } => {
@@ -174,6 +180,7 @@ fn main() -> anyhow_like::Result<()> {
                 actor: chronotope_core::model::ActorRef { id: principal, kind: chronotope_core::model::ActorKind::Crawler },
                 groups: Default::default(),
                 curator: false,
+                on_behalf_of: None,
             };
             let report = chronotope_extract::ingest(&mut kb, &who, &doc, &x, &chronotope_extract::IngestOptions { dry_run })?;
             println!("{}", serde_json::to_string_pretty(&report)?);

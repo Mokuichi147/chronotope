@@ -4,6 +4,7 @@ use crate::canonical::{CanonicalStore, Touch};
 use crate::command::{Command, Revision, RevisionHeader};
 use crate::crypto::KeyVault;
 use crate::embed::{Embedder, HashingEmbedder};
+use crate::history::{HistoryStore, Unindexed};
 use crate::materialize::{BranchState, MaterializeStats};
 use crate::store::columnar::{ColumnarStore, ObservationStore};
 use crate::store::log::{JsonlLog, MemoryLog, RevisionLog};
@@ -27,6 +28,7 @@ pub struct KbConfig {
     pub auto_embed: bool,
     /// 1 回の Materializer 実行で処理する最大件数（ブランチごと）。
     pub materialize_batch: usize,
+    /// Revision ログとスナップショットを書き込みごとに fsync する（電源断でもコミット済みの変更を失わない）。
     pub fsync: bool,
 }
 
@@ -37,7 +39,7 @@ impl Default for KbConfig {
             embed_types: ["Document", "Post", "Work", "Event"].iter().map(|s| s.to_string()).collect(),
             auto_embed: true,
             materialize_batch: 10_000,
-            fsync: false,
+            fsync: true,
         }
     }
 }
@@ -50,6 +52,7 @@ pub struct KnowledgeBase {
     pub(crate) objects: Arc<dyn ObjectStore>,
     log: Box<dyn RevisionLog>,
     pub(crate) columnar: ColumnarStore,
+    pub(crate) history: HistoryStore,
     pub(crate) embedder: Box<dyn Embedder>,
     pub(crate) config: KbConfig,
     clock: Box<dyn Fn() -> Tick + Send + Sync>,
@@ -83,6 +86,7 @@ impl KnowledgeBase {
             objects,
             log,
             columnar: ColumnarStore::default(),
+            history: HistoryStore::default(),
             embedder: Box::new(HashingEmbedder::default()),
             config,
             clock: Box::new(Tick::now),
@@ -101,7 +105,7 @@ impl KnowledgeBase {
         std::fs::create_dir_all(dir).map_err(|e| Error::Storage(e.to_string()))?;
         let log = JsonlLog::open(&dir.join("revisions.jsonl"), config.fsync)?;
         let revisions = log.read_all()?;
-        let objects = Arc::new(FsObjectStore::new(dir.join("objects"))?);
+        let objects = Arc::new(FsObjectStore::with_fsync(dir.join("objects"), config.fsync)?);
         let vault = KeyVault::open(dir.join("keys.json"))?;
         let mut kb = Self::with_parts(Box::new(log), objects, vault, config);
         if revisions.is_empty() {
@@ -141,6 +145,39 @@ impl KnowledgeBase {
 
     pub fn observations(&self) -> &dyn ObservationStore {
         self.columnar.observations.as_ref()
+    }
+
+    pub fn history(&self) -> &HistoryStore {
+        &self.history
+    }
+
+    /// スナップショットを（指定があれば暗号化して）保存する。
+    /// 返す ContentHash は平文のハッシュで、暗号化した場合は照合用に公開しない。
+    pub(crate) fn put_snapshot(&self, bytes: &[u8], encrypt_with: Option<KeyId>, media_type: Option<String>) -> Result<(ObjectRef, ContentHash, bool)> {
+        let plain_hash = crate::store::object::content_hash(bytes);
+        let (stored, encrypted_with) = match encrypt_with {
+            Some(k) => {
+                let (nonce, ct) = self.vault.encrypt_bytes(k, bytes)?;
+                let mut v = hex::decode(&nonce).map_err(|e| Error::Storage(e.to_string()))?;
+                v.extend(ct);
+                (v, Some(k))
+            }
+            None => (bytes.to_vec(), None),
+        };
+        let (h, fresh) = self.objects.put(&stored)?;
+        let r = ObjectRef { hash: h, size: stored.len() as u64, media_type, encrypted_with };
+        let shown = if encrypted_with.is_some() { ContentHash("withheld:encrypted".into()) } else { plain_hash };
+        Ok((r, shown, !fresh))
+    }
+
+    /// スナップショットの平文。
+    pub(crate) fn read_snapshot(&self, r: &ObjectRef) -> Result<std::result::Result<Vec<u8>, Unindexed>> {
+        let Some(bytes) = self.objects.get(&r.hash)? else { return Ok(Err(Unindexed::Missing)) };
+        Ok(match r.encrypted_with {
+            Some(k) if bytes.len() > 12 => self.vault.decrypt_bytes(&k, &hex::encode(&bytes[..12]), &bytes[12..]).ok_or(Unindexed::Shredded),
+            Some(_) => Err(Unindexed::Shredded),
+            None => Ok(bytes),
+        })
     }
 
     fn bootstrap(&mut self) -> Result<()> {
@@ -205,6 +242,23 @@ impl KnowledgeBase {
                 if let Err(e) = self.vault.shred(*key_id) {
                     tracing::error!(%key_id, error = %e, "failed to shred key");
                 }
+                self.history.shred(*key_id);
+            }
+            Command::RecordEvent { event } => {
+                let snapshot = self.store.acquisitions.get(&event.acquisition).and_then(|a| a.snapshot_ref.clone());
+                let content = match &snapshot {
+                    Some(r) => match self.read_snapshot(r) {
+                        Ok(Ok(b)) => String::from_utf8(b).map_err(|_| Unindexed::NotUtf8),
+                        Ok(Err(why)) => Err(why),
+                        Err(e) => {
+                            tracing::error!(event = %event.event_id, error = %e, "failed to read event snapshot");
+                            Err(Unindexed::Missing)
+                        }
+                    },
+                    None => Err(Unindexed::Missing),
+                };
+                let key = snapshot.and_then(|r| r.encrypted_with);
+                self.history.insert(event.clone(), content.as_deref().map_err(|e| *e), key);
             }
             Command::AddObservation { observation } => self.columnar.observations.insert(observation.clone()),
             Command::AddTrajectory { trajectory } => {
