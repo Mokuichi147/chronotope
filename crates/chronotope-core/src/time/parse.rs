@@ -786,7 +786,9 @@ fn parse_date(input: &str) -> Result<DateSpec> {
         julian = true;
         s = r.trim_start();
     }
-    let mut spec = if let Some(d) = try_iso(s)? {
+    let mut spec = if let Some(d) = try_month_day(s) {
+        d
+    } else if let Some(d) = try_iso(s)? {
         d
     } else if let Some(d) = try_japanese(s)? {
         d
@@ -807,6 +809,17 @@ fn parse_date(input: &str) -> Result<DateSpec> {
 }
 
 /// ISO 8601 風（`2026`, `2026-09`, `2026-09-20`, `2026-09-20T15:30:00+09:00`, `2026/9/20 15:30`）。
+/// 年の無い `月/日`（`10/14`）。分数と紛らわしいので、全体がこの形のときだけ。
+fn try_month_day(s: &str) -> Option<DateSpec> {
+    let (m, d) = s.split_once('/')?;
+    let ok = |x: &str| (1..=2).contains(&x.len()) && x.chars().all(|c| c.is_ascii_digit());
+    if !ok(m) || !ok(d) {
+        return None;
+    }
+    let (m, d): (u32, u32) = (m.parse().ok()?, d.parse().ok()?);
+    ((1..=12).contains(&m) && (1..=31).contains(&d)).then(|| DateSpec { month: Some(m), day: Some(d), ..Default::default() })
+}
+
 fn try_iso(s: &str) -> Result<Option<DateSpec>> {
     let (neg, body) = match s.strip_prefix('-') {
         Some(r) => (true, r),
@@ -1009,6 +1022,13 @@ fn try_english(s: &str) -> Result<Option<DateSpec>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn month_day_with_slash() {
+        let TimeAst::Date { date } = parse_expression("10/14").unwrap() else { panic!() };
+        assert_eq!((date.year, date.month, date.day), (None, Some(10), Some(14)));
+        assert!(parse_expression("13/40").is_err());
+    }
+
     use super::*;
 
     fn p(s: &str) -> TimeAst {

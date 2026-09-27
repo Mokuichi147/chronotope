@@ -239,12 +239,40 @@ impl CalendarFrame {
             d.month_offset = None;
         }
         if d.year.is_none() {
+            // 年（と月）の無い日付は、参照時刻に最も近いものを採る（1 月 2 日の記事の `12月31日` は前年、
+            // 12 月の告知の `2/20` は翌年、10 日の記事の `31日` は前月）。同じ近さなら参照時刻と同じ年・月。
             let r = reference.ok_or_else(|| Error::Invalid("year missing and no reference time".into()))?;
             let (y, m, _) = self.civil_of(r).ok_or_else(|| Error::invalid("reference outside calendar"))?;
-            d.year = Some(y);
-            if d.month.is_none() && d.day.is_some() {
-                d.month = Some(m);
+            let mut cands = vec![];
+            match (d.month, d.day) {
+                (Some(_), _) => {
+                    for yy in [y, y - 1, y + 1] {
+                        cands.push(DateSpec { year: Some(yy), ..d });
+                    }
+                }
+                (None, Some(_)) => {
+                    for off in [0, -1, 1] {
+                        if let Some((yy, mm)) = self.shift_month(y, m, off) {
+                            cands.push(DateSpec { year: Some(yy), month: Some(mm), ..d });
+                        }
+                    }
+                }
+                (None, None) => cands.push(DateSpec { year: Some(y), ..d }),
             }
+            let dist = |(s, e): (Tick, Tick)| {
+                if r < s {
+                    s.0 - r.0
+                } else if r >= e {
+                    r.0 - e.0 + 1
+                } else {
+                    0
+                }
+            };
+            return cands
+                .iter()
+                .filter_map(|c| self.date_bounds(c, reference).ok())
+                .min_by_key(|b| dist(*b))
+                .ok_or_else(|| Error::invalid("no valid date near the reference time"));
         }
         if let (CalendarKind::Gregorian { utc_offset_minutes }, _) = (&self.kind, ()) {
             return d.bounds_gregorian(*utc_offset_minutes);
@@ -313,6 +341,18 @@ pub fn hours_between(a: Tick, b: Tick) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn missing_year_uses_the_nearest_occurrence() {
+        let cal = CalendarFrame::gregorian();
+        let at = |iso: &str| Tick::parse_iso(iso).unwrap();
+        let bounds = |m: Option<u32>, d: u32, r: &str| cal.date_bounds(&DateSpec { month: m, day: Some(d), ..Default::default() }, Some(at(r))).unwrap().0;
+        // 年始の記事の `12月31日` は前年、年末の告知の `2月20日` は翌年、月初めの `31日` は前月
+        assert_eq!(bounds(Some(12), 31, "2026-01-02T00:00:00Z"), at("2025-12-31T00:00:00Z"));
+        assert_eq!(bounds(Some(2), 20, "2025-12-27T00:00:00Z"), at("2026-02-20T00:00:00Z"));
+        assert_eq!(bounds(None, 31, "2026-04-02T00:00:00Z"), at("2026-03-31T00:00:00Z"));
+        assert_eq!(bounds(Some(6), 10, "2026-06-10T12:00:00Z"), at("2026-06-10T00:00:00Z"));
+    }
     use super::*;
 
     #[test]
