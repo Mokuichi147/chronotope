@@ -257,6 +257,9 @@ pub enum QueryOp {
         length: Option<u64>,
         #[serde(default)]
         encoding: ContentEncoding,
+        /// 応答の時刻を表すグレゴリオ暦（`gregorian+09:00` など。既定は UTC）。
+        #[serde(default)]
+        calendar: Option<String>,
     },
     /// イベントの前後を会話内の記録順で取得する（`conversation` だけなら末尾）。
     HistoryContext {
@@ -275,6 +278,9 @@ pub enum QueryOp {
         /// 各イベントの本文を先頭から何バイトまで含めるか（0 で本文なし、最大 64 KiB）。
         #[serde(default)]
         max_content_bytes: Option<u64>,
+        /// 応答の時刻を表すグレゴリオ暦（`gregorian+09:00` など。既定は UTC）。
+        #[serde(default)]
+        calendar: Option<String>,
     },
     /// 会話の一覧（イベント数・最後の記録順・欠けている記録順の数）。
     HistoryConversations {
@@ -282,6 +288,9 @@ pub enum QueryOp {
         owner: Option<String>,
         #[serde(default)]
         limit: Option<usize>,
+        /// 応答の時刻を表すグレゴリオ暦（`gregorian+09:00` など。既定は UTC）。
+        #[serde(default)]
+        calendar: Option<String>,
     },
     TemporalRelation {
         a: String,
@@ -510,9 +519,13 @@ impl KnowledgeBase {
                 ops::get_acquisition(&ctx, *assertion, *acquisition, page)?
             }
             QueryOp::HistorySearch(spec) => history::search(&ctx, spec)?,
-            QueryOp::HistoryGet { event, owner, offset, length, encoding } => history::get(&ctx, event, owner.as_deref(), *offset, *length, *encoding)?,
-            QueryOp::HistoryContext { event, conversation, sequence, owner, before, after, max_content_bytes } => history::context(
+            QueryOp::HistoryGet { event, owner, offset, length, encoding, calendar } => {
+                let page = history::Page { offset: *offset, length: *length, encoding: *encoding };
+                history::get(&ctx, &history::TimeDisplay::new(&ctx, calendar.as_deref())?, event, owner.as_deref(), page)?
+            }
+            QueryOp::HistoryContext { event, conversation, sequence, owner, before, after, max_content_bytes, calendar } => history::context(
                 &ctx,
+                &history::TimeDisplay::new(&ctx, calendar.as_deref())?,
                 event.as_deref(),
                 conversation.as_deref(),
                 *sequence,
@@ -521,7 +534,9 @@ impl KnowledgeBase {
                 after.unwrap_or(5),
                 max_content_bytes.unwrap_or(4096),
             )?,
-            QueryOp::HistoryConversations { owner, limit } => history::conversations(&ctx, owner.as_deref(), limit.unwrap_or(50))?,
+            QueryOp::HistoryConversations { owner, limit, calendar } => {
+                history::conversations(&ctx, &history::TimeDisplay::new(&ctx, calendar.as_deref())?, owner.as_deref(), limit.unwrap_or(50))?
+            }
             QueryOp::TemporalRelation { a, b } => ops::temporal_relation(&ctx, branch, a, b)?,
             QueryOp::Timeline { entity, work, place, types, limit } => {
                 ops::timeline(&ctx, branch, entity.as_deref(), work.as_deref(), place.as_deref(), types, limit.unwrap_or(50))?

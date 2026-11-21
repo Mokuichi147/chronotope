@@ -34,7 +34,7 @@ impl Window {
     }
 }
 
-fn resolve_bound(ctx: &QCtx, s: &str, calendar: &str) -> Result<ResolvedTemporal> {
+pub(super) fn resolve_bound(ctx: &QCtx, s: &str, calendar: &str) -> Result<ResolvedTemporal> {
     let expr = TemporalExpression::strict(s, calendar)?;
     let cal = ctx.kb.store.calendar(calendar).ok_or_else(|| Error::not_found(format!("calendar `{calendar}`")))?;
     let facts = ctx.facts();

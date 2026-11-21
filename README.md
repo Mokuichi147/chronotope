@@ -141,10 +141,22 @@ curl -s localhost:7878/v1/write -H 'content-type: application/json' -H 'x-chrono
 
 | op | 内容 |
 |---|---|
-| `history_search` | 本文（正規化後の部分一致。`exact: true` で原文どおりの連続一致）・会話・`kinds`・`origins`・`call_id`・期間で探す。一致位置（原文のバイト範囲）と抜粋、`next_cursor` を返す |
+| `history_search` | 本文（正規化後の部分一致。`exact: true` で原文どおりの連続一致）・会話・`kinds`・`origins`・`call_id`・期間で探す。期間は `from` / `to` か、`time` の時間表現（`昨日` `先週` `直近2日間` `11月1日から7日まで` など）で指定する。一致位置（原文のバイト範囲）と抜粋、適用した期間（`period`）、`next_cursor` を返す |
 | `history_get` | イベント ID から原文を `offset` / `length` バイトずつ返す（UTF-8 の文字境界で区切り、`next_offset` が `null` になるまで読めば欠落なく復元できる。原文全体の `content_hash` 付き）。呼び出しと結果・訂正・要約元などの関連イベントも返す |
 | `history_context` | イベント（または会話と記録順）の前後を記録順で返す。`conversation` だけなら末尾。記録順の欠け（未同期の可能性）を `gaps` で示す |
 | `history_conversations` | 会話ごとのイベント数・最後の記録順・欠けている記録順の数（同期の再開位置の確認用） |
+
+どの操作も `calendar` にグレゴリオ暦（`gregorian+09:00` など）を指定すると、応答の時刻（`received_at` など）をその UTC オフセット付きの
+ISO 8601 で返し、応答の `calendar` に使った暦を示します（既定は UTC の `gregorian`）。`history_search` の `time` の相対表現は現在時刻を基準に
+この暦で解決するため、「昨日」は利用者の地域の日付の区切りになります。オフセットの無い `from` / `to` も、`calendar` を指定したときはその暦の時刻として読みます。
+`time` は表現があり得る範囲全体を期間にし（`先週` は月曜から日曜まで）、繰り返しの表現や `from` / `to` との併用はエラーです。
+指定した期間は応答の `period` に解決後の `from` / `to` として返るので、呼び出し元は期間が適用されたことと、その範囲を確認できます。
+
+```bash
+curl -s localhost:7878/v1/query -H 'content-type: application/json' -H 'x-chronotope-principal: alice' -H 'x-chronotope-kind: human' -d '{
+  "op": "history_search", "budget_ms": 500, "origins": ["human"], "time": "直近2日間", "calendar": "gregorian+09:00"
+}'
+```
 
 本文の索引はコミットと同時に更新するため、記録直後の検索にも索引の遅れはありません。UTF-8 でない本文や鍵を破棄した本文は
 本文検索の対象外で、その件数を `not_text_searchable` と警告で返します。検索で見つからなかったことは、その発言が無かったことを意味しません。
@@ -221,7 +233,7 @@ cargo run --release --bin chronotope -- ingest-text --data ./data --url https://
 | 5 列と Assertion の境界 | ラベル・外部 ID・acquired_at・content_hash・内部 ID は列、意味情報は Assertion |
 | 6 Predicate と外部語彙 | `PredicateDef`（domain / range / inverse / transitive / symmetric / functional / status / role）と OWL-Time・PROV-O・CIDOC CRM・Wikidata・UCUM への Mapping。AI は `proposed` のみ |
 | 7 時間 3 層 | A: `TemporalExpression`（raw_text / AST / calendar_frame、解析失敗でも原文保存）、B: 4 点境界 `FuzzyRange`（i64 ms の UTA tick）、C: `TemporalOrderGraph`（順序ラベル、派生物） |
-| 7 対応表現 | `2026-09-20 15:30`、`2026年9月頃`、`9月1日〜9月10日`、`数日前`、`先週火曜日`、`月曜日の夕方`、`毎週金曜日25:30`（day_offset 付きで 01:30 へ解決）、`A事件の3日前`、`Aより後、Bより前`、`紀元前300年`、`1980年代`、`19世紀`、`9月上旬`、`circa 1204`、`3 days ago`、`来月10日から12日まで`、`昭和50年5月5日`・`平成元年`（近代の元号。明治 5 年以前は旧暦として幅を持たせる）、`ユリウス暦1200年6月1日`（グレゴリオ暦へ換算）、`江戸時代前期`（時代区分）、`3時半ごろ`（時刻の「ごろ」は ±30 分）など |
+| 7 対応表現 | `2026-09-20 15:30`、`2026年9月頃`、`9月1日〜9月10日`、`数日前`、`先週火曜日`、`月曜日の夕方`、`毎週金曜日25:30`（day_offset 付きで 01:30 へ解決）、`A事件の3日前`、`Aより後、Bより前`、`紀元前300年`、`1980年代`、`19世紀`、`9月上旬`、`circa 1204`、`3 days ago`、`来月10日から12日まで`、`昭和50年5月5日`・`平成元年`（近代の元号。明治 5 年以前は旧暦として幅を持たせる）、`ユリウス暦1200年6月1日`（グレゴリオ暦へ換算）、`江戸時代前期`（時代区分）、`3時半ごろ`（時刻の「ごろ」は ±30 分）、`直近2日間`・`過去1週間`・`ここ数日`（N 単位前から今日まで）、`週末`・`先週末`（土曜から日曜まで）、`今朝`・`昨夜` など |
 | 8 時間関係 | Allen 13 関係のビットマスク・合成表・4 点境界からのあり得る関係（差分制約で厳密判定）。Pearce–Kelly の増分トポロジカル順序・循環検出。相対参照の深さ上限 8。変更 → 無効化キュー → 再計算 |
 | 9 時間の意味の分離 | event_time（occurred_at 等）/ valid_time / source_time / observed_at / acquired_at。`as_known_at` は acquired_at と状態変化の根拠時刻で判定 |
 | 10–11 Acquisition / Derivation | Source と Acquisition を分離（同 URL の再取得は別 Acquisition）。スナップショットは BLAKE3 の content-addressed Object Storage で自動重複排除。Derivation は抽出器・モデル・版・スキーマ版・スパン・確信度 |

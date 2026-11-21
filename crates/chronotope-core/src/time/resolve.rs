@@ -338,6 +338,37 @@ mod tests {
     }
 
     #[test]
+    fn recent_spans_weekends_and_day_parts() {
+        let cal = CalendarFrame::gregorian_with_offset(540);
+        // 2026-11-21 (土) 12:00 +09:00
+        let reference = Some(Tick::from_civil(2026, 11, 21, 12, 0, 0, 540));
+        let day = |d| Tick::from_civil(2026, 11, d, 0, 0, 0, 540);
+        let span = |raw| {
+            let r = res(raw, reference, &cal, &none).unwrap_or_else(|u| panic!("{raw}: {u:?}"));
+            (r.range.earliest_start, r.range.latest_end)
+        };
+        // `2日前から今日まで` と同じ範囲。
+        assert_eq!(span("直近2日間"), (day(19), day(22)));
+        assert_eq!(span("直近2日間"), span("2日前から今日まで"));
+        assert_eq!(span("過去2日"), (day(19), day(22)));
+        assert_eq!(span("past 2 days"), (day(19), day(22)));
+        // 週は日数に直す。
+        assert_eq!(span("この1週間"), (day(14), day(22)));
+        assert_eq!(span("過去1週間"), (day(14), day(22)));
+        // 数日 = 2〜5 日。最も早い開始は 5 日前。
+        assert_eq!(span("ここ数日"), (day(16), day(22)));
+        assert_eq!(span("直近3時間"), (Tick::from_civil(2026, 11, 21, 9, 0, 0, 540), Tick::from_civil(2026, 11, 21, 13, 0, 0, 540)));
+        // 週末は土曜日から日曜日まで。
+        assert_eq!(span("週末"), (day(21), day(23)));
+        assert_eq!(span("先週末"), (day(14), day(16)));
+        assert_eq!(span("来週末"), (day(28), day(30)));
+        assert_eq!(span("今朝"), (Tick::from_civil(2026, 11, 21, 5, 0, 0, 540), Tick::from_civil(2026, 11, 21, 10, 0, 0, 540)));
+        assert_eq!(span("昨夜"), span("昨日の夜"));
+        // 期間にならない書き方は従来どおり。
+        assert!(TemporalExpression::strict("過去2日前", &cal.key).is_err());
+    }
+
+    #[test]
     fn relative_month_resolves_from_reference() {
         let cal = CalendarFrame::gregorian_with_offset(540);
         let reference = Some(Tick::from_civil(2026, 9, 23, 0, 0, 0, 540));

@@ -3,7 +3,7 @@
 //! 対応例:
 //! `2026-09-20 15:30` / `2026年9月頃` / `9月1日〜9月10日` / `数日前` / `先週火曜日` /
 //! `月曜日の夕方` / `毎週金曜日25:30` / `A事件の3日前` / `Aより後、Bより前` / `紀元前300年` /
-//! `1980年代` / `19世紀` / `9月上旬` / `circa 1204` / `3 days ago` / `last tuesday` / `不明`
+//! `1980年代` / `19世紀` / `9月上旬` / `circa 1204` / `3 days ago` / `last tuesday` / `直近2日間` / `先週末` / `今朝` / `不明`
 
 use super::expr::*;
 use crate::{Error, Result};
@@ -187,6 +187,12 @@ fn parse_single(s: &str) -> Result<TimeAst> {
         return Ok(ast);
     }
     if let Some(ast) = parse_relative_to_event(s)? {
+        return Ok(ast);
+    }
+    if let Some(ast) = parse_recent_span(s) {
+        return Ok(ast);
+    }
+    if let Some(ast) = parse_weekend(s) {
         return Ok(ast);
     }
     if let Some(ast) = parse_relative_to_reference(s)? {
@@ -686,6 +692,28 @@ fn parse_relative_to_reference(s: &str) -> Result<Option<TimeAst>> {
         ("this month", 0, Unit::Month),
         ("next month", 1, Unit::Month),
     ];
+    // 日と時間帯を 1 語で言う表現（`今朝` = 今日の朝、`昨夜` = 昨日の夜）。
+    const DAY_PART_WORDS: &[(&str, i64, PartOfDay)] = &[
+        ("今朝", 0, PartOfDay::Morning),
+        ("今夕", 0, PartOfDay::Evening),
+        ("今晩", 0, PartOfDay::Night),
+        ("今夜", 0, PartOfDay::Night),
+        ("昨朝", -1, PartOfDay::Morning),
+        ("昨晩", -1, PartOfDay::Night),
+        ("昨夜", -1, PartOfDay::Night),
+        ("明朝", 1, PartOfDay::Morning),
+        ("明晩", 1, PartOfDay::Night),
+        ("this morning", 0, PartOfDay::Morning),
+        ("this afternoon", 0, PartOfDay::Pm),
+        ("this evening", 0, PartOfDay::Evening),
+        ("tonight", 0, PartOfDay::Night),
+        ("last night", -1, PartOfDay::Night),
+    ];
+    for (w, d, part) in DAY_PART_WORDS {
+        if s == *w {
+            return Ok(Some(TimeAst::Relative { anchor: Anchor::Reference, offset: OffsetRange::exact(*d), unit: Unit::Day, clock: Some(Clock::Part(*part)) }));
+        }
+    }
     for (w, d) in DAY_WORDS {
         if let Some(rest) = s.strip_prefix(w) {
             let (clock, _) = parse_trailing_clock(rest)?;
@@ -701,6 +729,49 @@ fn parse_relative_to_reference(s: &str) -> Result<Option<TimeAst>> {
         return Ok(Some(TimeAst::Relative { anchor: Anchor::Reference, offset, unit, clock: None }));
     }
     Ok(None)
+}
+
+/// 参照時刻までの直近の期間（`直近2日間` / `過去1週間` / `ここ数日` / `この3か月` / `past 3 days`）。
+/// `2日前から今日まで` と同じく、N 単位前を含む日（時間・分なら N 単位前の時・分）から参照時刻を含む日までとする。
+/// 週は日数に直す（`1週間前` は週全体ではなく 7 日前の日）。
+fn parse_recent_span(s: &str) -> Option<TimeAst> {
+    const PREFIXES: &[&str] = &["直近", "過去", "ここ", "この", "最近の", "the last ", "the past ", "last ", "past "];
+    let rest = PREFIXES.iter().find_map(|p| s.strip_prefix(p))?;
+    let (q, rest) = take_quantity(rest)?;
+    let (unit, rest) = take_unit(rest)?;
+    if !matches!(rest.trim(), "" | "間") || q.min <= 0 {
+        return None;
+    }
+    let (q, unit) = match unit {
+        Unit::Week => (OffsetRange { min: q.min * 7, max: q.max * 7 }, Unit::Day),
+        u => (q, u),
+    };
+    let end_unit = match unit {
+        Unit::Second | Unit::Minute | Unit::Hour => unit,
+        _ => Unit::Day,
+    };
+    let start = TimeAst::Relative { anchor: Anchor::Reference, offset: OffsetRange { min: -q.max, max: -q.min }, unit, clock: None };
+    let end = TimeAst::Relative { anchor: Anchor::Reference, offset: OffsetRange::exact(0), unit: end_unit, clock: None };
+    Some(TimeAst::Interval { start: Box::new(start), end: Box::new(end) })
+}
+
+/// 週末（その週の土曜日から日曜日まで。`週末` だけなら今週）。
+fn parse_weekend(s: &str) -> Option<TimeAst> {
+    const WEEKENDS: &[(&str, i32)] = &[
+        ("先々週末", -2),
+        ("先週末", -1),
+        ("今週末", 0),
+        ("週末", 0),
+        ("再来週末", 2),
+        ("来週末", 1),
+        ("last weekend", -1),
+        ("this weekend", 0),
+        ("weekend", 0),
+        ("next weekend", 1),
+    ];
+    let off = WEEKENDS.iter().find(|(w, _)| s == *w).map(|(_, o)| *o)?;
+    let day = |weekday| TimeAst::Weekday { week_offset: Some(off), weekday: Some(weekday), clock: None };
+    Some(TimeAst::Interval { start: Box::new(day(5)), end: Box::new(day(6)) })
 }
 
 fn parse_week_relative(s: &str) -> Result<Option<TimeAst>> {
