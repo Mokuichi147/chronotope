@@ -352,8 +352,10 @@ mod tests {
         assert_eq!(span("直近2日間"), span("2日前から今日まで"));
         assert_eq!(span("過去2日"), (day(19), day(22)));
         assert_eq!(span("past 2 days"), (day(19), day(22)));
-        // 週は日数に直す。
+        // 週・月・年は日数に直す（月は 30 日、年は 365 日）。
         assert_eq!(span("この1週間"), (day(14), day(22)));
+        assert_eq!(span("この1か月"), (Tick::from_civil(2026, 10, 22, 0, 0, 0, 540), day(22)));
+        assert_eq!(span("直近1年間"), (Tick::from_civil(2025, 11, 21, 0, 0, 0, 540), day(22)));
         assert_eq!(span("過去1週間"), (day(14), day(22)));
         // 数日 = 2〜5 日。最も早い開始は 5 日前。
         assert_eq!(span("ここ数日"), (day(16), day(22)));

@@ -733,7 +733,8 @@ fn parse_relative_to_reference(s: &str) -> Result<Option<TimeAst>> {
 
 /// 参照時刻までの直近の期間（`直近2日間` / `過去1週間` / `ここ数日` / `この3か月` / `past 3 days`）。
 /// `2日前から今日まで` と同じく、N 単位前を含む日（時間・分なら N 単位前の時・分）から参照時刻を含む日までとする。
-/// 週は日数に直す（`1週間前` は週全体ではなく 7 日前の日）。
+/// 週・月・年は日数に直す（週は 7 日、月は 30 日、年は 365 日）。`1か月前` のように暦の月全体へ広げると、
+/// `直近1年間` が前年の 1 月 1 日からになるため。
 fn parse_recent_span(s: &str) -> Option<TimeAst> {
     const PREFIXES: &[&str] = &["直近", "過去", "ここ", "この", "最近の", "the last ", "the past ", "last ", "past "];
     let rest = PREFIXES.iter().find_map(|p| s.strip_prefix(p))?;
@@ -742,8 +743,11 @@ fn parse_recent_span(s: &str) -> Option<TimeAst> {
     if !matches!(rest.trim(), "" | "間") || q.min <= 0 {
         return None;
     }
+    let days = |n: i64| (OffsetRange { min: q.min * n, max: q.max * n }, Unit::Day);
     let (q, unit) = match unit {
-        Unit::Week => (OffsetRange { min: q.min * 7, max: q.max * 7 }, Unit::Day),
+        Unit::Week => days(7),
+        Unit::Month => days(30),
+        Unit::Year => days(365),
         u => (q, u),
     };
     let end_unit = match unit {

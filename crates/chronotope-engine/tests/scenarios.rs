@@ -1136,6 +1136,8 @@ fn history_search_by_time_expression_in_a_local_calendar() {
     let s = hq(&kb, &alice, json!({ "op": "history_search", "from": "2026-09-22", "to": "2026-09-23 00:00", "calendar": "gregorian+09:00" }));
     assert_eq!(ids(&s), ["late-night"]);
     assert_eq!(s["period"]["time"], Value::Null);
+    let s = hq(&kb, &alice, json!({ "op": "history_search", "from": "-inf", "to": "2026-09-22", "calendar": "gregorian+09:00", "order": "oldest" }));
+    assert_eq!(ids(&s), ["last-week", "monday-noon"]);
     // 期間を指定しなければ period は null。
     assert_eq!(hq(&kb, &alice, json!({ "op": "history_search" }))["period"], Value::Null);
     // 他の履歴操作も同じ暦で時刻を返す。

@@ -267,6 +267,7 @@ fn search_window(ctx: &QCtx, spec: &HistorySearch, display: &TimeDisplay) -> Res
         match s.as_deref() {
             None => Ok(None),
             Some(x) if display.0.is_none() => Tick::parse_iso(x).map(Some),
+            Some(x) if matches!(x.trim(), "-inf" | "+inf" | "inf") => Tick::parse_iso(x).map(Some),
             Some(x) => super::search::resolve_bound(ctx, x, calendar).map(|r| Some(r.range.earliest_start)),
         }
     };
