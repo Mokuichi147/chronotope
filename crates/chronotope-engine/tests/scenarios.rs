@@ -1090,3 +1090,71 @@ fn history_context_reports_sequence_gaps() {
     let l = hq(&kb, &alice, json!({ "op": "history_conversations" }));
     assert_eq!(l["conversations"][0]["missing_sequences"], 2);
 }
+
+#[test]
+fn history_search_by_time_expression_in_a_local_calendar() {
+    let mut kb = kb();
+    // 2026-09-23 12:00 +09:00（水）。
+    kb.set_clock(|| Tick::from_civil(2026, 9, 23, 12, 0, 0, 540));
+    let alice = user("alice");
+    let said = |id: &str, seq: u64, at: &str| {
+        let mut e = event(id, "c1", seq, "message", "human", id);
+        e["received_at"] = json!(at);
+        e
+    };
+    record(
+        &mut kb,
+        &alice,
+        vec![
+            // 9/22 02:00 +09:00 は UTC では 9/21。現地の「昨日」に入る。
+            said("late-night", 1, "2026-09-21T17:00:00Z"),
+            said("monday-noon", 2, "2026-09-21T03:00:00Z"),
+            said("today", 3, "2026-09-23T01:00:00Z"),
+            said("last-week", 4, "2026-09-16T03:00:00Z"),
+            // 9/23 05:00 +09:00 は UTC では 9/22。UTC の「昨日」にだけ入る。
+            said("early-morning", 5, "2026-09-22T20:00:00Z"),
+        ],
+    );
+    let ids = |s: &Value| s["events"].as_array().unwrap().iter().map(|e| e["event_id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let local = |time: &str| hq(&kb, &alice, json!({ "op": "history_search", "time": time, "calendar": "gregorian+09:00", "order": "oldest" }));
+
+    let s = local("昨日");
+    assert_eq!(ids(&s), ["late-night"]);
+    assert_eq!(s["period"], json!({ "time": "昨日", "from": "2026-09-22T00:00:00+09:00", "to": "2026-09-23T00:00:00+09:00" }));
+    assert_eq!(s["calendar"], "gregorian+09:00");
+    // 時刻は暦の UTC オフセットで返す（同じ瞬間の RFC 3339）。
+    assert_eq!(s["events"][0]["received_at"], "2026-09-22T02:00:00+09:00");
+    // UTC の暦では同じ「昨日」でも日の区切りが変わる。
+    let utc = hq(&kb, &alice, json!({ "op": "history_search", "time": "昨日", "order": "oldest" }));
+    assert_eq!(ids(&utc), ["early-morning"]);
+    assert_eq!(utc["calendar"], "gregorian");
+    assert_eq!(utc["events"][0]["received_at"], "2026-09-22T20:00:00Z");
+
+    assert_eq!(ids(&local("直近2日間")), ["monday-noon", "late-night", "early-morning", "today"]);
+    assert_eq!(ids(&local("先週")), ["last-week"]);
+    // オフセットの無い from / to は暦の時刻として読む。
+    let s = hq(&kb, &alice, json!({ "op": "history_search", "from": "2026-09-22", "to": "2026-09-23 00:00", "calendar": "gregorian+09:00" }));
+    assert_eq!(ids(&s), ["late-night"]);
+    assert_eq!(s["period"]["time"], Value::Null);
+    let s = hq(&kb, &alice, json!({ "op": "history_search", "from": "-inf", "to": "2026-09-22", "calendar": "gregorian+09:00", "order": "oldest" }));
+    assert_eq!(ids(&s), ["last-week", "monday-noon"]);
+    // 期間を指定しなければ period は null。
+    assert_eq!(hq(&kb, &alice, json!({ "op": "history_search" }))["period"], Value::Null);
+    // 他の履歴操作も同じ暦で時刻を返す。
+    let g = hq(&kb, &alice, json!({ "op": "history_get", "event": "today", "calendar": "gregorian+09:00" }));
+    assert_eq!(g["event"]["received_at"], "2026-09-23T10:00:00+09:00");
+    let c = hq(&kb, &alice, json!({ "op": "history_context", "conversation": "c1", "calendar": "gregorian+09:00" }));
+    assert_eq!(c["calendar"], "gregorian+09:00");
+    let list = hq(&kb, &alice, json!({ "op": "history_conversations", "calendar": "gregorian+09:00" }));
+    assert_eq!(list["conversations"][0]["last_at"], "2026-09-23T10:00:00+09:00");
+
+    let err = |body: Value| {
+        let mut body = body;
+        body["budget_ms"] = json!(2000);
+        kb.query_json(&alice, &body.to_string()).expect_err("query should fail").to_string()
+    };
+    assert!(err(json!({ "op": "history_search", "time": "昨日", "from": "2026-09-01" })).contains("not both"));
+    assert!(err(json!({ "op": "history_search", "time": "毎週金曜日" })).contains("repeats"));
+    assert!(err(json!({ "op": "history_search", "time": "そのうち" })).contains("could not be read as a period"));
+    assert!(err(json!({ "op": "history_get", "event": "today", "calendar": "shire" })).contains("calendar"));
+}

@@ -12,6 +12,7 @@ use crate::text::{MappedText, gram_query_tokens, query_terms};
 use base64::Engine as _;
 use chronotope_core::model::*;
 use chronotope_core::time::Tick;
+use chronotope_core::time::calendar::{CalendarFrame, CalendarKind};
 use chronotope_core::*;
 use roaring::RoaringBitmap;
 use serde::Deserialize;
@@ -106,11 +107,18 @@ pub struct HistorySearch {
     pub origins: Vec<EventOrigin>,
     #[serde(default)]
     pub call_id: Option<String>,
-    /// 期間（受信時刻、無ければ記録時刻）。`[from, to)`。
+    /// 期間（受信時刻、無ければ記録時刻）。`[from, to)`。オフセットの無い日時は `calendar` の時刻として読む。
     #[serde(default)]
     pub from: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
+    /// 期間を時間表現で指定する（`昨日` / `先週` / `直近2日間` / `11月1日から7日まで` など）。
+    /// 相対表現は現在時刻を基準に `calendar` の暦で解決し、その表現があり得る範囲全体を期間とする。`from` / `to` とは併用できない。
+    #[serde(default)]
+    pub time: Option<String>,
+    /// 期間の解決と応答の時刻に使うグレゴリオ暦（`gregorian+09:00` など。既定は UTC の `gregorian`）。
+    #[serde(default)]
+    pub calendar: Option<String>,
     #[serde(default)]
     pub order: HistoryOrder,
     #[serde(default)]
@@ -118,6 +126,35 @@ pub struct HistorySearch {
     /// 前回の結果の `next_cursor`。
     #[serde(default)]
     pub cursor: Option<String>,
+}
+
+/// 応答の時刻を表す暦。`calendar` を指定すればその UTC オフセット付きの ISO 8601、無ければ UTC（`Z`）。
+pub(crate) struct TimeDisplay(Option<CalendarFrame>);
+
+impl TimeDisplay {
+    pub(crate) fn new(ctx: &QCtx, calendar: Option<&str>) -> Result<Self> {
+        let Some(key) = calendar else { return Ok(TimeDisplay(None)) };
+        let cal = ctx.kb.store.calendar(key).ok_or_else(|| Error::not_found(format!("calendar `{key}`")))?;
+        if !matches!(cal.kind, CalendarKind::Gregorian { .. }) {
+            return Err(Error::invalid(format!("history times need a Gregorian calendar such as `gregorian+09:00`, not `{key}`")));
+        }
+        Ok(TimeDisplay(Some(cal)))
+    }
+
+    fn iso(&self, t: Tick) -> String {
+        self.0.as_ref().map_or_else(|| t.to_iso(), |c| c.format(t))
+    }
+
+    fn key(&self) -> &str {
+        self.0.as_ref().map_or("gregorian", |c| c.key.as_str())
+    }
+}
+
+/// `history_get` で読む本文の範囲。
+pub(crate) struct Page {
+    pub offset: u64,
+    pub length: Option<u64>,
+    pub encoding: ContentEncoding,
 }
 
 fn owner_scope<'a>(ctx: &'a QCtx, owner: Option<&'a str>) -> &'a str {
@@ -137,7 +174,7 @@ fn find_event<'a>(ctx: &'a QCtx, owner: &str, event_id: &str) -> Result<(u32, &'
         .ok_or_else(|| Error::not_found(format!("event `{event_id}`")))
 }
 
-fn event_json(ctx: &QCtx, doc: u32, ev: &ConversationEvent) -> Json {
+fn event_json(ctx: &QCtx, display: &TimeDisplay, doc: u32, ev: &ConversationEvent) -> Json {
     let h = &ctx.kb.history;
     let acq = ctx.kb.store.acquisitions.get(&ev.acquisition);
     let f = &ev.fields;
@@ -152,8 +189,8 @@ fn event_json(ctx: &QCtx, doc: u32, ev: &ConversationEvent) -> Json {
         "origin": f.origin,
         "api_role": f.api_role,
         "speaker": f.speaker,
-        "received_at": f.received_at.map(Tick::to_iso),
-        "recorded_at": ev.recorded_at.to_iso(),
+        "received_at": f.received_at.map(|t| display.iso(t)),
+        "recorded_at": display.iso(ev.recorded_at),
         "recorded_by": ev.recorded_by,
         "response_id": f.response_id,
         "call_id": f.call_id,
@@ -211,8 +248,36 @@ fn index_status(ctx: &QCtx) -> Json {
     json!({ "consistent": true, "revision": ctx.kb.store.head_seq, "events": ctx.kb.history.len() })
 }
 
+/// 検索期間 `[from, to)`。`time` は表現があり得る範囲全体、`from` / `to` はその時刻。
+fn search_window(ctx: &QCtx, spec: &HistorySearch, display: &TimeDisplay) -> Result<Option<(Option<Tick>, Option<Tick>)>> {
+    let calendar = display.key();
+    if let Some(expr) = spec.time.as_deref() {
+        if spec.from.is_some() || spec.to.is_some() {
+            return Err(Error::invalid("use either `time` or `from` / `to`, not both"));
+        }
+        let r = super::search::resolve_bound(ctx, expr, calendar).map_err(|e| Error::invalid(format!("time `{expr}` could not be read as a period: {e}")))?;
+        if r.recurrence.is_some() {
+            return Err(Error::invalid(format!("`{expr}` repeats; give a single period as `time`")));
+        }
+        let finite = |t: Tick| t.is_finite().then_some(t);
+        return Ok(Some((finite(r.range.earliest_start), finite(r.range.latest_end))));
+    }
+    // オフセットの無い日時は、暦を指定したときだけその時刻として読む（指定が無ければ従来どおり UTC）。
+    let bound = |s: &Option<String>| -> Result<Option<Tick>> {
+        match s.as_deref() {
+            None => Ok(None),
+            Some(x) if display.0.is_none() => Tick::parse_iso(x).map(Some),
+            Some(x) if matches!(x.trim(), "-inf" | "+inf" | "inf") => Tick::parse_iso(x).map(Some),
+            Some(x) => super::search::resolve_bound(ctx, x, calendar).map(|r| Some(r.range.earliest_start)),
+        }
+    };
+    let (from, to) = (bound(&spec.from)?, bound(&spec.to)?);
+    Ok((from.is_some() || to.is_some()).then_some((from, to)))
+}
+
 pub(super) fn search(ctx: &QCtx, spec: &HistorySearch) -> Result<Json> {
     let h = &ctx.kb.history;
+    let display = TimeDisplay::new(ctx, spec.calendar.as_deref())?;
     let owner = owner_scope(ctx, spec.owner.as_deref());
     let limit = spec.limit.unwrap_or(20).clamp(1, 200);
     let mut convs: Vec<&String> = spec.conversations.iter().chain(spec.conversation.as_ref()).collect();
@@ -221,8 +286,13 @@ pub(super) fn search(ctx: &QCtx, spec: &HistorySearch) -> Result<Json> {
     if spec.order == HistoryOrder::Sequence && convs.len() != 1 {
         return Err(Error::invalid("order `sequence` needs exactly one conversation"));
     }
-    let from = spec.from.as_deref().map(Tick::parse_iso).transpose()?;
-    let to = spec.to.as_deref().map(Tick::parse_iso).transpose()?;
+    let window = search_window(ctx, spec, &display)?;
+    let (from, to) = window.unwrap_or((None, None));
+    if let (Some(f), Some(t)) = (from, to) {
+        if f >= t {
+            return Err(Error::invalid("empty period: `from` must be before `to`"));
+        }
+    }
     let text = spec.text.as_deref().filter(|t| !t.trim().is_empty());
     let terms = match (text, spec.exact) {
         (Some(t), false) => query_terms(t),
@@ -293,7 +363,7 @@ pub(super) fn search(ctx: &QCtx, spec: &HistorySearch) -> Result<Json> {
             Ok(b) => String::from_utf8(b).ok(),
             Err(_) => None,
         };
-        let mut j = event_json(ctx, d, ev);
+        let mut j = event_json(ctx, &display, d, ev);
         match (text, content.as_deref()) {
             (Some(q), Some(s)) => {
                 let found = if spec.exact { s.find(q).map(|at| (at, at + q.len())) } else { MappedText::new(s).find_all(&terms) };
@@ -324,11 +394,19 @@ pub(super) fn search(ctx: &QCtx, spec: &HistorySearch) -> Result<Json> {
         "next_cursor": next_cursor,
         "candidates": keyed.len(),
         "not_text_searchable": not_searchable,
+        // 適用した期間。クライアントは指定した期間が無視されていないことをここで確かめられる。
+        "period": window.map(|(f, t)| json!({
+            "time": spec.time,
+            "from": f.map(|x| display.iso(x)),
+            "to": t.map(|x| display.iso(x)),
+        })),
+        "calendar": display.key(),
         "index": index_status(ctx),
     }))
 }
 
-pub(super) fn get(ctx: &QCtx, event: &str, owner: Option<&str>, offset: u64, length: Option<u64>, encoding: ContentEncoding) -> Result<Json> {
+pub(super) fn get(ctx: &QCtx, display: &TimeDisplay, event: &str, owner: Option<&str>, page: Page) -> Result<Json> {
+    let Page { offset, length, encoding } = page;
     let h = &ctx.kb.history;
     let owner = owner_scope(ctx, owner);
     let (doc, ev) = find_event(ctx, owner, event)?;
@@ -349,7 +427,7 @@ pub(super) fn get(ctx: &QCtx, event: &str, owner: Option<&str>, offset: u64, len
     };
     let peers = |docs: &[u32]| docs.iter().filter(|d| **d != doc).filter_map(|d| h.get(*d)).map(|e| brief(&e.event_id)).collect::<Vec<_>>();
     Ok(json!({
-        "event": event_json(ctx, doc, ev),
+        "event": event_json(ctx, display, doc, ev),
         "content": content,
         "related": {
             "call": peers(h.call_peers(ev)),
@@ -358,12 +436,14 @@ pub(super) fn get(ctx: &QCtx, event: &str, owner: Option<&str>, offset: u64, len
             "parent": ev.fields.parent_event.as_ref().map(brief),
             "derived_from": ev.fields.derived_from.iter().map(brief).collect::<Vec<_>>(),
         },
+        "calendar": display.key(),
     }))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn context(
     ctx: &QCtx,
+    display: &TimeDisplay,
     event: Option<&str>,
     conversation: Option<&str>,
     sequence: Option<u64>,
@@ -403,7 +483,7 @@ pub(super) fn context(
     let mut events = vec![];
     for &(_, d) in &window {
         let Some(ev) = h.get(d) else { continue };
-        let mut j = event_json(ctx, d, ev);
+        let mut j = event_json(ctx, display, d, ev);
         if max_content_bytes > 0 {
             j["content"] = match event_content(ctx, ev)? {
                 Ok(b) => content_page(&b, 0, Some(max_content_bytes), ContentEncoding::Auto)?,
@@ -426,11 +506,12 @@ pub(super) fn context(
         "gaps": gaps,
         "has_more_before": has_more_before,
         "has_more_after": has_more_after,
+        "calendar": display.key(),
         "index": index_status(ctx),
     }))
 }
 
-pub(super) fn conversations(ctx: &QCtx, owner: Option<&str>, limit: usize) -> Result<Json> {
+pub(super) fn conversations(ctx: &QCtx, display: &TimeDisplay, owner: Option<&str>, limit: usize) -> Result<Json> {
     let h = &ctx.kb.history;
     let owner = owner_scope(ctx, owner);
     let mut out: Vec<(Tick, Json)> = vec![];
@@ -452,8 +533,8 @@ pub(super) fn conversations(ctx: &QCtx, owner: Option<&str>, limit: usize) -> Re
                 "first_sequence": first.fields.sequence,
                 "last_sequence": last.fields.sequence,
                 "missing_sequences": expected - evs.len() as u64,
-                "first_at": evs.iter().map(|e| e.occurred_at()).min().map(Tick::to_iso),
-                "last_at": latest.to_iso(),
+                "first_at": evs.iter().map(|e| e.occurred_at()).min().map(|t| display.iso(t)),
+                "last_at": display.iso(latest),
             }),
         ));
     }
@@ -463,6 +544,7 @@ pub(super) fn conversations(ctx: &QCtx, owner: Option<&str>, limit: usize) -> Re
         "owner": owner,
         "conversations": out.into_iter().take(limit.clamp(1, 1000)).map(|(_, j)| j).collect::<Vec<_>>(),
         "total": total,
+        "calendar": display.key(),
         "index": index_status(ctx),
     }))
 }
