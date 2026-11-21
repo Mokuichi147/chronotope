@@ -174,3 +174,32 @@ fn works_with_the_real_clock() {
     assert!(r.warnings.iter().all(|w| !w.contains("skipped")), "{:?}", r.warnings);
     assert_eq!(r.assertions.len(), 2, "occurred_at + took_place_at");
 }
+
+#[test]
+fn announcement_dates_resolve_against_the_published_time() {
+    // 年の無い `11月28日から29日まで` は公開日時（2026-11-20）に最も近い年の 2 日間として解決する。
+    // 本文冒頭の `【11/28開催】` は公開日時ではない。
+    let mut kb = KnowledgeBase::in_memory(KbConfig::default());
+    kb.set_clock(|| Tick::from_civil(2026, 11, 21, 0, 0, 0, 0));
+    let d: Document = serde_json::from_value(json!({
+        "text": "【11/28開催】渋谷でクラフトビールフェス\n渋谷区の代々木公園で、11月28日から29日まで「代々木クラフトビールフェス2026」が開かれる。全国から40のブルワリーが参加する予定で、入場は無料。主催した東京ビール協会によると、昨年は約2万人が来場した。",
+        "published": "2026-11-20T09:00:00+09:00",
+        "acquired_at": "2026-11-21T00:00:00Z"
+    }))
+    .unwrap();
+    let x = RuleExtractor::from_kb(&kb).extract(&d);
+    let r = ingest(&mut kb, &crawler(), &d, &x, &IngestOptions::default()).unwrap();
+    assert_eq!(x.source_time, None);
+    kb.materialize_all().unwrap();
+    let s = q(&kb, json!({ "op": "search", "budget_ms": 500, "types": ["Event"], "time": { "expression": "2026-11-28" } }));
+    let hit = &s["results"][0];
+    assert_eq!(hit["label"], "代々木クラフトビールフェス2026", "{s}");
+    assert_eq!(hit["time"]["earliest_start"], "2026-11-28T00:00:00+09:00");
+    assert_eq!(hit["time"]["latest_end"], "2026-11-30T00:00:00+09:00");
+    let event = r.entities.iter().find(|e| e.label == "代々木クラフトビールフェス2026").unwrap().resource.clone().unwrap();
+    let c = q(&kb, json!({ "op": "expand_claims", "budget_ms": 500, "id": event, "include_incoming": true }));
+    let text = c.to_string();
+    for want in ["took_place_at", "organized_by", "代々木公園", "東京ビール協会"] {
+        assert!(text.contains(want), "{want} missing: {c}");
+    }
+}

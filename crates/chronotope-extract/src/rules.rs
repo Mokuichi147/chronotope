@@ -1,8 +1,8 @@
 //! 規則ベースの日本語抽出器（外部サービスを呼ばない）。
 //!
 //! - 実体: KB のラベルを辞書（gazetteer）として最長一致 + 接尾辞・文型のパターン
-//!   （`〇〇氏` `〇〇大臣`、`主催した〇〇`、`〇〇駅` `〇〇県` …）
-//! - 出来事: `〇〇が開かれ` `〇〇が発生` などの文型
+//!   （`〇〇氏` `〇〇大臣`、`主催した〇〇` `主催：〇〇`、`〇〇駅` `〇〇県` `会場：〇〇` …）
+//! - 出来事: `〇〇が開かれ` `〇〇が発生` などの文型。鉤括弧の正式名（`「〇〇フェス」が開かれる`）はその名前を使う
 //! - 時間: 時間表現らしい文字の連続から、エンジンの時間パーサで解析できる最長部分を採用（原文のまま渡す）
 //! - 関係: 同じ文の中の出来事と場所・時間、`参加` `出席` などを含む文の人物
 //! - 数値: `約1200人が参加` → 観測値 attendees
@@ -500,6 +500,10 @@ fn find_times_clean(chars: &[char]) -> Vec<(usize, usize, String)> {
                 if chars[s + len - 1] == '月' && s + len < to && is_name_char(chars[s + len]) && !is_time_char(chars[s + len]) {
                     continue;
                 }
+                // `2日間` `3年間` `5時間` は期間で、日付・時刻ではない
+                if s + len < to && chars[s + len] == '間' && "年月週日時分秒".contains(chars[s + len - 1]) {
+                    continue;
+                }
                 let sub = text(chars, s, s + len);
                 // 告知の `【10/14】` `（9/3・午前）` `11/25開催` のように、括弧や区切りに挟まれた `月/日`
                 let month_day = is_month_day(&sub) && {
@@ -542,9 +546,11 @@ fn find_times_clean(chars: &[char]) -> Vec<(usize, usize, String)> {
         while k < to && chars[k] == ' ' {
             k += 1;
         }
-        // `4月7日と21日`（2 回に分けて行われた出来事）も区間として扱う。
-        let conn =
-            ["から", "〜", "～", "~", "-", "－", "—", "と"].iter().find(|c| chars[k..].starts_with(&c.chars().collect::<Vec<_>>())).map(|c| c.chars().count());
+        // `4月7日と21日` `12月5日（土）・6日（日）`（2 回に分けて行われた出来事・2 日間の催し）も区間として扱う。
+        let conn = ["から", "〜", "～", "~", "-", "－", "—", "と", "・"]
+            .iter()
+            .find(|c| chars[k..].starts_with(&c.chars().collect::<Vec<_>>()))
+            .map(|c| c.chars().count());
         if let Some(cl) = conn {
             let mut k2 = k + cl;
             while k2 < to && chars[k2] == ' ' {
@@ -552,9 +558,15 @@ fn find_times_clean(chars: &[char]) -> Vec<(usize, usize, String)> {
             }
             let j2 = run_after(chars, k2, is_time_char);
             // 相手側は解析できる最長の部分まで縮める（`23日の2回` → `23日`）。
+            // `・` は日付を並べる場合（`5日・6日`）だけ。`明治元年・1868年5月24日` のような言い換えはつなげない。
+            let dot = chars[k] == '・';
             for end in (k2 + 1..=j2).rev() {
                 let with_made = if chars[end..].starts_with(&['ま', 'で']) { end + 2 } else { end };
-                let joined = format!("{sub}から{}", text(chars, k2, with_made));
+                let other = text(chars, k2, with_made);
+                if dot && (!sub.ends_with('日') || other.contains('年')) {
+                    continue;
+                }
+                let joined = format!("{sub}から{other}");
                 if candidate_ast(&joined).is_some() {
                     e = with_made;
                     sub = joined;
@@ -619,8 +631,11 @@ pub fn find_periods(chars: &[char], from: usize, to: usize) -> Vec<(usize, usize
 }
 
 /// 実体名の先頭になり得ない位置か（`第9回山川選挙` の `回山川選挙`、`2020年海辺市` の `年海辺市` など）。
+/// `代` は数の後（`1990年代` `三代`）だけ。`代々木公園` のような地名の先頭の `代` は弾かない。
 fn bad_start(chars: &[char], s: usize) -> bool {
-    "年回第号代".contains(chars[s]) || (s > 0 && is_digit(chars[s - 1]))
+    let prev = s.checked_sub(1).map(|p| chars[p]);
+    let after_number = prev.is_some_and(|p| is_digit(p) || "〇一二三四五六七八九十百千年".contains(p));
+    "年回第号々".contains(chars[s]) || (chars[s] == '代' && after_number) || prev.is_some_and(is_digit)
 }
 
 /// 報道の見出しから、角括弧の見出し語（`【速報】` `【山川県】`）と末尾の出典表記を除く。
@@ -689,14 +704,53 @@ fn sentences(chars: &[char]) -> Vec<(usize, usize)> {
     out
 }
 
-/// 冒頭の `【2026年9月21日】` のような見出し（範囲の終端と、中の日付）。
-fn header(chars: &[char]) -> (usize, Option<String>) {
-    if chars.first() != Some(&'【') {
-        return (0, None);
+/// 本文冒頭の見出し。
+#[derive(Debug, Default)]
+struct Header {
+    /// 見出しの終端（`【…】` の後。本文の 1 行目が題名なら、その行の後）
+    end: usize,
+    /// `【2026年9月21日】` のように日付だけの角括弧の日付（記事の日付とみなす）
+    date: Option<String>,
+    /// `【11/28開催】` のように日付に語が添えられた角括弧の日付、公開日時があるときの年の無い `【11/28】`（出来事の日付の候補）
+    event_time: Option<String>,
+    /// 本文の 1 行目に書かれた題名（`【11/28開催】渋谷で〇〇フェス`）
+    title: Option<String>,
+}
+
+/// 角括弧の中で、日付に添えられていても記事の日付とみなす語（`【2026年9月21日 更新】`）。
+const HEADER_DATE_WORDS: &[&str] = &["更新", "公開", "掲載", "配信", "発表", "発行", "現在"];
+
+/// 本文冒頭の見出し（`【2026年9月21日】` `【11/28開催】〇〇フェス` の行）。
+/// 1 行目が句点を含まず、日付の角括弧の見出しで始まるか文書の題名と同じなら、その行を題名とみなして本文から外す。
+fn header(chars: &[char], title: Option<&str>, published: bool) -> Header {
+    let mut h = Header::default();
+    if chars.first() == Some(&'【') {
+        if let Some(end) = chars.iter().position(|c| *c == '】') {
+            h.end = end + 1;
+            if let Some((s, e, raw)) = find_times(chars, 1, end).into_iter().next() {
+                let rest = format!("{}{}", text(chars, 1, s), text(chars, e, end));
+                let rest = rest.trim_matches(|c: char| c.is_whitespace() || "・:：（）()".contains(c));
+                // 公開日時があれば、年の無い `【11/28】` も記事の日付ではなく出来事の日付の候補とみなす
+                let yearless = TemporalExpression::strict(&raw, "gregorian").is_ok_and(|x| lacks_year(&x.ast));
+                if (rest.is_empty() || HEADER_DATE_WORDS.contains(&rest)) && !(published && yearless) {
+                    h.date = Some(raw);
+                } else if raw.contains(['日', '/']) {
+                    h.event_time = Some(raw);
+                }
+            }
+        }
     }
-    let Some(end) = chars.iter().position(|c| *c == '】') else { return (0, None) };
-    let t = find_times(chars, 1, end).into_iter().next().map(|x| x.2);
-    (end + 1, t)
+    let Some(nl) = chars.iter().position(|c| *c == '\n') else { return h };
+    let line = text(chars, 0, nl);
+    let rest_has_body = chars[nl..].iter().any(|c| !c.is_whitespace());
+    let line_title = headline(&line);
+    let same_as_title = title.is_some_and(|t| headline(t) == line_title || t.trim() == line.trim());
+    let dated = h.date.is_some() || h.event_time.is_some();
+    if rest_has_body && !line.contains('。') && (2..=80).contains(&line_title.chars().count()) && (dated || same_as_title) {
+        h.end = nl + 1;
+        h.title = Some(line_title);
+    }
+    h
 }
 
 /// `約1,200人` `3万人` → (値, 概数か, 数の開始位置)。`end` は「人」の位置。
@@ -738,6 +792,54 @@ const NOT_NAME: &[&str] = &["担当", "政府", "省", "庁", "委員", "協会"
 const NOT_NAME_END: &[char] = &['県', '市', '町', '村', '府', '都', '区', '国', '郡', '党', '軍', '家', '氏', '院'];
 const EVENT_TRIGGERS: &[&str] =
     &["が開かれ", "が開催", "が行われ", "が発生", "が起き", "が起こ", "が実施", "が始ま", "が開幕", "が閉幕", "を開催", "を開い", "を実施"];
+/// 鉤括弧の名前（`「〇〇フェス」が催される`）にだけ使う文型。`を開く` は `「設定」を開き` のような操作の説明が多いので使わない。
+const QUOTED_EVENT_TRIGGERS: &[&str] = &["が催され", "を催", "が開幕", "が開演"];
+/// 告知の項目名（`主催は〇〇` `主催：〇〇`）。
+const ORGANIZER_FIELDS: &[&str] = &["主催は", "主催：", "主催:", "主催／", "主催/"];
+/// 告知の日時・会場の項目名（`日時：12月5日` `会場：丸石ホール`）。
+const DATE_FIELDS: &[&str] = &["日時", "日程", "開催日時", "開催日", "開催期間", "期間"];
+const VENUE_FIELDS: &[&str] = &["会場", "場所", "開催場所"];
+/// 会場の項目に書かれても場所ではない値。
+const NOT_VENUE: &[&str] = &["未定", "調整中", "検討中", "非公開", "後日", "別途", "オンライン", "全国", "各地", "各会場", "ホテル", "自宅"];
+
+/// 項目名（`日時` `会場`）に続く区切り（`：` `:` `は`）の後の位置。行頭か区切り記号の直後の項目名に限る。
+fn field_values(chars: &[char], names: &[&str]) -> Vec<usize> {
+    let mut out = vec![];
+    for name in names {
+        for p in find_all(chars, name) {
+            let at_line_start =
+                p == 0 || matches!(chars[p - 1], '\n' | '■' | '●' | '◆' | '・' | '【' | '［' | '[' | '／' | '/' | ' ' | '　' | '◇' | '○' | '。');
+            let q = p + name.chars().count();
+            let sep = ["：", ":", "は", "】", "］", "]", "／"].iter().find(|s| chars[q..].starts_with(&s.chars().collect::<Vec<_>>()));
+            if let (true, Some(sep)) = (at_line_start, sep) {
+                out.push(run_after(chars, q + sep.chars().count(), |c| c == ' ' || c == '　'));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 出来事の文型（`が開かれ` `を開催` …）の直前にある鉤括弧の名前（`「〇〇」`）の範囲（括弧の内側）。
+fn quoted_event_names(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut out = vec![];
+    for trig in EVENT_TRIGGERS.iter().chain(QUOTED_EVENT_TRIGGERS) {
+        for p in find_all(chars, trig) {
+            let Some(close) = p.checked_sub(1).filter(|&c| matches!(chars[c], '」' | '』')) else { continue };
+            let open_ch = if chars[close] == '」' { '「' } else { '『' };
+            let Some(open) = (close.saturating_sub(41)..close).rev().find(|&x| chars[x] == open_ch) else { continue };
+            let inner = text(chars, open + 1, close);
+            let n = inner.chars().count();
+            if (2..=40).contains(&n) && !inner.contains(['。', '、', '「', '」', '\n']) && !out.contains(&(open + 1, close)) {
+                out.push((open + 1, close));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// `〇〇があり` は一般的すぎるので、出来事らしい名詞のときだけ出来事とする。
 const WEAK_EVENT_TRIGGERS: &[&str] = &["があり", "があった"];
 const EVENT_NOUN_SUFFIXES: &[&str] = &[
@@ -808,6 +910,9 @@ const PLACE_SUFFIXES: &[(&str, &str)] = &[
     ("岳", "Place"),
     ("山", "Place"),
 ];
+/// 人数がこの出来事ではなく前回・例年のものであることを示す語。
+/// `昨年は約2万人が来場` の形に限る（`昨年を上回る約3万人が来場` は今回の人数）。
+const PAST_EDITION_WORDS: &[&str] = &["昨年は", "去年は", "前年は", "前回は", "昨季は", "昨年も", "前回も", "例年", "毎年"];
 const COUNT_METRICS: &[(&str, &str)] = &[
     ("が参加", "attendees"),
     ("が出席", "attendees"),
@@ -1193,6 +1298,11 @@ fn news_time(times: &[(usize, usize, String)], reference: Option<Tick>, calendar
         .map(|((d, _), t)| (t.clone(), d))
 }
 
+/// 過去のことを伝える文（`…した。` `…だった。`）か。告知（`…を開催します。`）や予定（`…が開かれる。`）は先のこと。
+fn past_tense(sentence: &str) -> bool {
+    sentence.trim_end().trim_end_matches(['。', '」', '）']).ends_with('た')
+}
+
 /// 日付に続く句（読点・句点まで。注記の括弧は読み飛ばす）。
 fn clause_after(chars: &[char], e: usize) -> String {
     let mut k = e;
@@ -1408,13 +1518,34 @@ impl RuleExtractor {
 
     pub fn extract(&self, doc: &Document) -> Extraction {
         let chars: Vec<char> = doc.text.chars().collect();
-        let (header_end, header_time) = header(&chars);
+        let hd = header(&chars, doc.title.as_deref(), doc.published.is_some());
+        let (header_end, header_time) = (hd.end, hd.date.clone());
+        // 題名が別に渡されなければ、本文の 1 行目の題名を使う
+        let title: Option<String> = doc.title.clone().or_else(|| hd.title.clone());
         let sents = sentences(&chars);
         let sent_of = |pos: usize| sents.iter().position(|&(s, e)| s <= pos && pos < e).unwrap_or(0);
         let mut b = Builder::default();
 
-        // 1. 主催者（`主催した〇〇` / `〇〇が主催`）
+        // 0. 鉤括弧で書かれた出来事の正式名（`「〇〇フェス2026」が開かれる`）。
+        // 中の地名・組織名（`代々木` `丸石公園`）を別の実体として拾わないよう、先に範囲を確保しておく。
+        let quoted_events = quoted_event_names(&chars);
+        b.taken.extend(quoted_events.iter().map(|&(s, e)| (s, e)));
+
+        // 1. 主催者（`主催した〇〇` / `〇〇が主催` / 告知の `主催は〇〇` `主催：〇〇`）
         let mut organizers = vec![];
+        for p in ORGANIZER_FIELDS.iter().flat_map(|w| find_all(&chars, w).into_iter().map(move |p| p + w.chars().count())) {
+            let s = run_after(&chars, p, |c| c == ' ' || c == '　');
+            // 項目の値は区切りまで（`主催：町田市青少年委員の会）` の `の会` も含める）
+            let e = run_after(&chars, s, |c| is_word(c) || "のノヶ".contains(c));
+            let e = (s..e).rev().find(|&x| is_word(chars[x])).map_or(s, |x| x + 1);
+            let ends = e >= chars.len()
+                || "）)、。\n／/ 　,，・【■●".contains(chars[e])
+                || ["で", "が", "と", "により", "による"].iter().any(|w| chars[e..].starts_with(&w.chars().collect::<Vec<_>>()));
+            if (2..=24).contains(&(e - s)) && ends && chars[s] != '同' && !b.overlaps(s, e) {
+                let label = text(&chars, s, e);
+                organizers.push(b.add(Kind::Organization, &["Organization"], &label, &chars, s, e, None, None));
+            }
+        }
         for p in find_all(&chars, "主催した").into_iter().chain(find_all(&chars, "主催する")) {
             let s = p + 4;
             let e = run_after(&chars, s, is_word);
@@ -1552,7 +1683,7 @@ impl RuleExtractor {
             // 年・回などの助数詞から始めない（`2020年丸石山` は `丸石山` から探す）。
             if bad_start(&chars, i) {
                 // `2020年丸石山` の `年` などは 1 字だけ飛ばし、数の直後の語（`2県` `3人`）は語ごと飛ばす。
-                i = if "年回第号代".contains(chars[i]) { i + 1 } else { run_after(&chars, i, is_name_char) };
+                i = if "年回第号代々".contains(chars[i]) { i + 1 } else { run_after(&chars, i, is_name_char) };
                 continue;
             }
             // 既に辞書で一致した部分（`海辺市浜辺町` の `海辺市`）は飛ばして、その後ろから探す。
@@ -1635,6 +1766,25 @@ impl RuleExtractor {
                 }
             }
             i = e;
+        }
+
+        // 告知の会場の項目（`会場：丸石ストリーム`）。接尾辞で場所と分からない名前も、項目名があれば場所とする。
+        let venue_fields = field_values(&chars, VENUE_FIELDS);
+        for &s in &venue_fields {
+            let e = run_after(&chars, s, is_word);
+            let label = text(&chars, s, e);
+            // 値だけで終わる項目に限る（`会場は180名で満員` `場所はクリークに沿って` のような文は除く）
+            let value_only = e >= chars.len() || matches!(chars[e], '\n' | '。' | '（' | '(' | '、' | ' ' | '　' | '／' | '/' | '【' | '■' | '●');
+            if (2..=30).contains(&(e - s))
+                && value_only
+                && !is_digit(chars[s])
+                && !NOT_VENUE.contains(&label.as_str())
+                && !b.overlaps(s, e)
+                && !bad_start(&chars, s)
+                && !valid_time(&label)
+            {
+                b.add(Kind::Place, &["Place"], &label, &chars, s, e, None, None);
+            }
         }
 
         // `同市` `同県` `同国` は、それより前の最も近い同じ種類の地名を指す
@@ -1785,7 +1935,7 @@ impl RuleExtractor {
             for p in find_all(&chars, trig) {
                 let s = run_before(&chars, p, is_word);
                 if (2..=20).contains(&(p - s)) && !b.overlaps(s, p) && !valid_time(&text(&chars, s, p)) {
-                    ev_marks.push((s, p));
+                    ev_marks.push((s, p, false));
                 }
             }
         }
@@ -1794,26 +1944,28 @@ impl RuleExtractor {
                 let s = run_before(&chars, p, is_word);
                 let noun = text(&chars, s, p);
                 if (2..=20).contains(&(p - s)) && !b.overlaps(s, p) && EVENT_NOUN_SUFFIXES.iter().any(|x| noun.ends_with(x)) {
-                    ev_marks.push((s, p));
+                    ev_marks.push((s, p, false));
                 }
             }
         }
+        // 鉤括弧の正式名（`「〇〇フェス2026」が開かれる`）
+        ev_marks.extend(quoted_events.iter().map(|&(s, e)| (s, e, true)));
         ev_marks.sort();
         ev_marks.dedup();
         // 5c. 報道（見出しの日付か公開日時がある文書）では、本文の最初の文を主な出来事の文とする。
         // その文に文型の出来事が無ければ、見出しを主な出来事にする。
-        let news_doc = !has_topic && (header_time.is_some() || doc.published.is_some());
+        let news_doc = !has_topic && (header_time.is_some() || hd.event_time.is_some() || doc.published.is_some());
         let lead = sents.iter().position(|&(a, z)| z > header_end && text(&chars, a.max(header_end), z).trim().chars().count() > 5).filter(|_| news_doc);
         let mut headline_event = None;
-        if let Some(li) = lead.filter(|li| !ev_marks.iter().any(|(s, _)| sent_of(*s) == *li)) {
-            if let Some(title) = doc.title.as_deref().map(headline).filter(|t| (2..=80).contains(&t.chars().count())) {
+        if let Some(li) = lead.filter(|li| !ev_marks.iter().any(|(s, ..)| sent_of(*s) == *li)) {
+            if let Some(title) = title.as_deref().map(headline).filter(|t| (2..=80).contains(&t.chars().count())) {
                 let start = sents[li].0.max(header_end);
                 let r = b.add(Kind::Event, &["Event"], &title, &chars, start, start, None, None);
                 headline_event = Some(r.clone());
                 events.push((r, start, start));
             }
         }
-        for (s, p) in ev_marks {
+        for (s, p, quoted) in ev_marks {
             let noun = text(&chars, s, p);
             let si = sent_of(s);
             // 主題文の出来事と同じ文の中の言い換え（`…で地震が発生`）は別の出来事にしない。
@@ -1824,7 +1976,8 @@ impl RuleExtractor {
             if has_topic && noun.chars().count() <= 4 {
                 continue;
             }
-            let place = place_in(&b.mentions, &b.entities, si, s, 0);
+            let place = if quoted { None } else { place_in(&b.mentions, &b.entities, si, s, 0) };
+            // 鉤括弧の正式名はそのまま、一般名（`防災イベント`）は場所を添えて区別する（`東京駅の防災イベント`）
             let label = match &place {
                 Some((m, _)) => {
                     let pl = b.entities.iter().find(|x| x.reference == m.reference).map(|x| x.label.clone()).unwrap_or_default();
@@ -1854,9 +2007,18 @@ impl RuleExtractor {
             .and_then(|p| Tick::parse_iso(p).ok())
             .or_else(|| header_time.as_deref().and_then(|h| resolve_range(h, None, &calendar)).map(|(a, _)| Tick(a)));
         // 見出しの日付（`【4/12開催】` `丸石広場 2024/10/14（月曜）`）
-        let title_time = doc.title.as_deref().and_then(|t| {
-            let tc: Vec<char> = t.chars().collect();
-            find_times(&tc, 0, tc.len()).into_iter().map(|(_, _, raw)| raw).find(|raw| raw.contains(['日', '/']))
+        // 本文冒頭の `【11/28開催】` は記事の日付ではなく、題名の日付と同じく出来事の日付の候補とする。
+        let title_time = title
+            .as_deref()
+            .and_then(|t| {
+                let tc: Vec<char> = t.chars().collect();
+                find_times(&tc, 0, tc.len()).into_iter().map(|(_, _, raw)| raw).find(|raw| raw.contains(['日', '/']))
+            })
+            .or_else(|| hd.event_time.clone());
+        // 告知の日時の項目（`日時：12月5日（土）10時から`）の日付
+        let field_time = field_values(&chars, DATE_FIELDS).into_iter().find_map(|v| {
+            let line_end = (v..chars.len()).find(|&x| matches!(chars[x], '\n' | '。')).unwrap_or(chars.len());
+            find_times(&chars, v, line_end).into_iter().next().filter(|(a, ..)| *a == v)
         });
         for (ev, s, body) in &events {
             let si = sent_of(*body);
@@ -1875,10 +2037,15 @@ impl RuleExtractor {
             let is_news_lead = lead == Some(si);
             if is_news_lead {
                 if let Some((t, dist)) = news_time(&find_times(&chars, body_from, se), news_reference, &calendar) {
-                    chosen = Some((t, 0.8));
                     // 最初の文の日付が記事の日付から離れている（背景の出来事や先の予定）なら、
                     // 続く 2 文にある記事の日付に近い日付（`…12日に発表した`）を使う。
-                    if dist > NEWS_WINDOW_DAYS {
+                    // ただし先の予定を伝える文（`…が開かれる。` `…を開催します。`）の出来事の先の日付は、そのまま出来事の日付とする
+                    // （見出しを出来事にした場合は、文の日付が出来事の日付とは限らないので除く）。
+                    let upcoming = Some(ev) != headline_event.as_ref()
+                        && !past_tense(&text(&chars, ss, se))
+                        && resolve_range(&t.2, news_reference, &calendar).zip(news_reference).is_some_and(|((a, _), r)| a > r.0);
+                    chosen = Some((t, 0.8));
+                    if dist > NEWS_WINDOW_DAYS && !upcoming {
                         let later: Vec<_> = sents.iter().skip(si + 1).take(2).flat_map(|&(a, z)| find_times(&chars, a, z)).collect();
                         if let Some((t2, _)) = news_time(&later, news_reference, &calendar).filter(|(_, d)| *d <= NEWS_WINDOW_DAYS) {
                             chosen = Some((t2, 0.6));
@@ -1917,6 +2084,12 @@ impl RuleExtractor {
             // 本文の最初の文に月まで書かれた日付が無ければ、見出しの日付を使う（告知の `【4/12開催】丸石講座`）。
             // 本文の `今日の予定` `1日講座` `毎年5月…` のような月の無い・繰り返しの表現より、見出しの日付を採る。
             let explicit = |raw: &str| (raw.contains('月') || raw.contains('/')) && !raw.starts_with('毎');
+            // 告知の `日時：` の項目があれば、見出しの日付より先にそれを使う。
+            if is_news_lead && !chosen.as_ref().is_some_and(|((_, _, raw), _)| explicit(raw)) {
+                if let Some(t) = field_time.clone() {
+                    chosen = Some((t, 0.7));
+                }
+            }
             if is_news_lead && !chosen.as_ref().is_some_and(|((_, _, raw), _)| explicit(raw)) && title_time.as_deref().is_some_and(explicit) {
                 if let Some(t) = &title_time {
                     chosen = Some(((usize::MAX, usize::MAX, t.clone()), 0.6));
@@ -1926,10 +2099,10 @@ impl RuleExtractor {
             // 過去のことを伝える文（`…した。`）に限る。告知（`…を開催します。`）や予定（`…へ` `…する予定`）は先のことなので付けない。
             if chosen.is_none() && is_news_lead {
                 let lead_text = text(&chars, ss, se);
-                let past = lead_text.trim_end().trim_end_matches(['。', '」', '）']).ends_with('た');
+                let past = past_tense(&lead_text);
                 let future = !past
                     || ["予定", "見通し", "方針", "見込み"].iter().any(|w| lead_text.contains(w))
-                    || doc.title.as_deref().is_some_and(|t| t.trim_end().ends_with('へ'));
+                    || title.as_deref().is_some_and(|t| t.trim_end().ends_with('へ'));
                 let dated = header_time.clone().map(|h| (h, 0, header_end)).or_else(|| doc.published.as_deref().and_then(|p| p.get(..10)).map(|d| (d.to_string(), 0, 0)));
                 if let (false, Some((d, a, z))) = (future, dated) {
                     chosen = Some(((a, z, format!("{d}以前")), 0.4));
@@ -1962,7 +2135,14 @@ impl RuleExtractor {
                 } else {
                     return None;
                 };
-                (si + 1..until).find_map(|sj| place_in(&b.mentions, &b.entities, sj, sents[sj].0, sents[sj].0))
+                (si + 1..until).find_map(|sj| place_in(&b.mentions, &b.entities, sj, sents[sj].0, sents[sj].0)).or_else(|| {
+                    // 告知の `会場：` の項目（日時・内容の項目の後に書かれていることがある）
+                    is_news_lead.then_some(())?;
+                    venue_fields.iter().find_map(|&v| {
+                        let sj = sent_of(v);
+                        place_in(&b.mentions, &b.entities, sj, v, v)
+                    })
+                })
             });
             if let Some((m, sub)) = place {
                 claims.push(ClaimMention {
@@ -2031,6 +2211,11 @@ impl RuleExtractor {
         let mut observations = vec![];
         for (pat, metric) in COUNT_METRICS {
             for p in find_all(&chars, &format!("人{pat}")) {
+                // 前回・例年の人数（`昨年は約2万人が来場した`）は、この出来事の観測値ではない
+                let (ss, _) = sents[sent_of(p)];
+                if PAST_EDITION_WORDS.iter().any(|w| text(&chars, ss, p).contains(w)) {
+                    continue;
+                }
                 if let (Some((v, approx, s)), Some(ev)) = (number_before(&chars, p), nearest_event(p)) {
                     observations.push(ObservationMention {
                         target: ev,
@@ -2516,5 +2701,120 @@ mod tests {
         let x = rx.extract(&doc("山田 太郎（やまだ たろう、1900年1月2日 - 1980年3月4日）は、日本の俳優。山川県海辺市の病院で死去した。"));
         let p = x.entities.iter().find(|e| e.types == ["Person"]).unwrap();
         assert_eq!(label_of(&x, claim(&x, &p.reference, "death_place")).as_deref(), Some("海辺市"));
+    }
+
+    /// 告知記事の出来事（label, occurred_at, took_place_at, organized_by）。
+    fn announcement(x: &Extraction) -> (String, Option<String>, Option<String>, Option<String>) {
+        let ev = x.entities.iter().find(|e| e.types == ["Event"]).unwrap_or_else(|| panic!("no event: {:?}", x.entities));
+        let r = &ev.reference;
+        (ev.label.clone(), time_of(claim(x, r, "occurred_at")), label_of(x, claim(x, r, "took_place_at")), label_of(x, claim(x, r, "organized_by")))
+    }
+
+    #[test]
+    fn announcements_with_quoted_event_names() {
+        let rx = RuleExtractor::new(Gazetteer::default());
+        let extract = |v: serde_json::Value| rx.extract(&serde_json::from_value(v).unwrap());
+        let published = "2026-11-20T09:00:00+09:00";
+        let title = "【11/28開催】渋谷でクラフトビールフェス";
+        let body = "渋谷区の代々木公園で、11月28日から29日まで「代々木クラフトビールフェス2026」が開かれる。全国から40のブルワリーが参加する予定で、入場は無料。主催した東京ビール協会によると、昨年は約2万人が来場した。";
+        let with_line = format!("{title}\n{body}");
+        // 題名を別に渡す / 題名を渡しつつ本文の 1 行目にも書く / 本文の 1 行目だけに書く、のいずれでも同じ結果になる
+        for v in [
+            serde_json::json!({ "title": title, "text": body, "published": published }),
+            serde_json::json!({ "title": title, "text": with_line, "published": published }),
+            serde_json::json!({ "text": with_line, "published": published }),
+        ] {
+            let x = extract(v.clone());
+            let want = (
+                "代々木クラフトビールフェス2026".to_string(),
+                Some("11月28日から29日まで".to_string()),
+                Some("代々木公園".to_string()),
+                Some("東京ビール協会".to_string()),
+            );
+            assert_eq!(announcement(&x), want, "{v}");
+            assert_eq!(x.entities.iter().filter(|e| e.types == ["Event"]).count(), 1, "{v}: {:?}", x.entities);
+            // 見出しの `【11/28開催】` は記事の日付ではない
+            assert_eq!(x.source_time, None, "{v}");
+            // 鉤括弧の中の `代々木` を地名にせず、`代々木公園` の `代` も落とさない
+            assert!(x.entities.iter().all(|e| !e.label.starts_with('々') && e.label != "代々木"), "{v}: {:?}", x.entities);
+            // 昨年の来場者数は今回の観測値ではない
+            assert!(x.observations.is_empty(), "{v}: {:?}", x.observations);
+        }
+        // 公開日時が無ければ、見出しの `開催` の日付を出来事の日付の候補にする（記事の日付にはしない）
+        let x = extract(serde_json::json!({ "text": "【11/28開催】渋谷でクラフトビールフェス\n「代々木クラフトビールフェス2026」が代々木公園で開かれる。" }));
+        assert_eq!(x.source_time, None);
+        assert_eq!(announcement(&x).1.as_deref(), Some("11/28"));
+        // 日付だけの見出しは従来どおり記事の日付
+        let x = extract(serde_json::json!({ "text": "【2026年11月20日】\n代々木公園で28日、「丸石フェス」が開かれる。" }));
+        assert_eq!(x.source_time.as_deref(), Some("2026年11月20日"));
+        assert_eq!(announcement(&x).1.as_deref(), Some("28日"));
+
+        // `を開催します`、曜日の注記を挟んだ 2 日間、`主催は〇〇`
+        let x = extract(serde_json::json!({
+            "title": "【参加無料】丸石マルシェ開催のお知らせ",
+            "published": published,
+            "text": "海辺市の丸石広場で12月5日（土）・6日（日）の2日間、「第3回丸石マルシェ」を開催します。主催は丸石商店会。12月1日までに申し込みが必要です。"
+        }));
+        assert_eq!(announcement(&x), ("第3回丸石マルシェ".into(), Some("12月5日から6日".into()), Some("丸石広場".into()), Some("丸石商店会".into())));
+
+        // 項目で書かれた告知（`■日時：` `■会場：` `■主催：`）。会場の項目が離れていても使う
+        let x = extract(serde_json::json!({
+            "title": "丸石ジャズナイト2026",
+            "published": published,
+            "text": "今年も「丸石ジャズナイト」が開かれます。\n■日時：2026年12月12日（土）18時開演\n■内容：ジャズの生演奏\n■定員：先着100名\n■会場：海辺ストリーム\n■主催：海辺ジャズ協会"
+        }));
+        let (label, time, place, org) = announcement(&x);
+        assert_eq!(label, "丸石ジャズナイト");
+        assert!(time.as_deref().is_some_and(|t| t.starts_with("2026年12月12日")), "{time:?}");
+        assert_eq!(place.as_deref(), Some("海辺ストリーム"));
+        assert_eq!(org.as_deref(), Some("海辺ジャズ協会"));
+
+        // 先の予定を伝える文の日付は、続く文の締め切り（`25日まで`）に置き換えない
+        let x = extract(serde_json::json!({
+            "title": "丸石公園でフリーマーケット",
+            "published": published,
+            "text": "丸石公園で来月5日に「丸石フリーマーケット」が開かれる。出店の申し込みは25日まで受け付ける。"
+        }));
+        assert_eq!(announcement(&x), ("丸石フリーマーケット".into(), Some("来月5日".into()), Some("丸石公園".into()), None));
+
+        // 公開日時があれば、語の無い `【11/28】` も出来事の日付の候補（記事の日付にしない）
+        let x = extract(
+            serde_json::json!({ "published": published, "text": "【11/28】渋谷でクラフトビールフェス\n「代々木クラフトビールフェス2026」が代々木公園で開かれる。" }),
+        );
+        assert_eq!(x.source_time, None);
+        assert_eq!(announcement(&x).1.as_deref(), Some("11/28"));
+        // `主催は〇〇です。` `主催は〇〇で、`
+        for t in [
+            "丸石公園で12月5日に「丸石まつり」が開かれる。主催は丸石商店会です。",
+            "丸石公園で12月5日に「丸石まつり」が開かれる。主催は丸石商店会で、入場は無料。",
+        ] {
+            let x = extract(serde_json::json!({ "published": published, "text": t }));
+            assert_eq!(announcement(&x).3.as_deref(), Some("丸石商店会"), "{t}");
+        }
+        // 操作の説明（`「設定」を開き`）は出来事にしない
+        let x = extract(serde_json::json!({ "published": published, "text": "アプリの「マイドライブ」を開き、ファイルを選ぶ。" }));
+        assert!(x.entities.iter().all(|e| e.types != ["Event"]), "{:?}", x.entities);
+        // 前回の人数は除くが、前回と比べた今回の人数は残す
+        let x = extract(serde_json::json!({ "published": published, "text": "丸石公園で20日、「丸石まつり」が開かれた。昨年を上回る約3万人が来場した。" }));
+        assert_eq!(x.observations.len(), 1);
+
+        // 項目の主催者名は区切りまで（`の会` を含める）
+        let x = extract(
+            serde_json::json!({ "published": published, "text": "丸石公園で12月5日に「丸石スタンプラリー」が開かれる（主催：海辺市青少年委員の会）。" }),
+        );
+        assert_eq!(announcement(&x).3.as_deref(), Some("海辺市青少年委員の会"));
+
+        // 期間（`2日間`）は日付にせず、`・` は日付を並べた場合だけつなぐ（`明治元年・1868年5月24日` は言い換え）
+        let times = |t: &str| -> Vec<String> {
+            let c: Vec<char> = t.chars().collect();
+            find_times(&c, 0, c.len()).into_iter().map(|x| x.2).collect()
+        };
+        assert_eq!(times("2日間のホールでの発表"), Vec::<String>::new());
+        assert!(times("慶応4年閏4月3日（明治元年・1868年5月24日）に").iter().all(|t| !t.contains("から")));
+        assert_eq!(times("1月21日・1月22日に"), vec!["1月21日から1月22日"]);
+
+        // 年代の `代` は従来どおり地名の先頭にしない
+        let x = extract(serde_json::json!({ "text": "2020年5月1日、1990年代丸石山で事故が起きた。" }));
+        assert!(x.entities.iter().all(|e| !e.label.starts_with(['代', '年'])), "{:?}", x.entities);
     }
 }
