@@ -487,7 +487,9 @@ fn parse_tz(s: &str) -> (Option<i32>, &str) {
     }
     if let Some(sign) = t.chars().next().filter(|c| *c == '+' || *c == '-') {
         let body = &t[1..];
-        let digits: String = body.chars().filter(|c| c.is_ascii_digit() || *c == ':').take(5).collect();
+        // 先頭から連続する数字と `:` だけを読む（`filter` だと `-12時30` の `時` を飛ばして数え、
+        // 残りを切り出す位置が文字境界からずれて panic する）。
+        let digits: String = body.chars().take_while(|c| c.is_ascii_digit() || *c == ':').take(5).collect();
         let clean: String = digits.chars().filter(|c| c.is_ascii_digit()).collect();
         if clean.len() == 4 || clean.len() == 2 {
             let h: i32 = clean[..2].parse().unwrap_or(0);
@@ -1254,5 +1256,28 @@ mod tests {
             o => panic!("{o:?}"),
         }
         assert!(matches!(p("不明"), TimeAst::Unknown));
+    }
+
+    #[test]
+    fn utc_offsets() {
+        assert_eq!(parse_tz("+09:00"), (Some(540), ""));
+        assert_eq!(parse_tz("+0900"), (Some(540), ""));
+        assert_eq!(parse_tz("-05"), (Some(-300), ""));
+        assert_eq!(parse_tz("-05:30"), (Some(-330), ""));
+        assert_eq!(parse_tz("+09:00 頃"), (Some(540), " 頃"));
+        // 連続した数字だけを読む（以前は `時` を飛ばして数え、文字境界の外で切り出して panic した）。
+        // 残りの `時30` は呼び出し側が余分な文字列としてエラーにする。
+        assert_eq!(parse_tz("-1時00"), (None, "-1時00"));
+        assert_eq!(parse_tz("-12時30"), (Some(-720), "時30"));
+        assert_eq!(parse_tz("+1時0分"), (None, "+1時0分"));
+        let tz = |s: &str| match p(s) {
+            TimeAst::Date { date } => date.utc_offset_minutes,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(tz("2026-09-20T15:30:00+09:00"), Some(540));
+        assert_eq!(tz("2026-09-20T15:30+0900"), Some(540));
+        assert_eq!(tz("2026-09-20 15:30-05"), Some(-300));
+        assert!(parse_expression("2026-09-20 15:30-12時30").is_err());
+        assert!(parse_expression("2026-09-20 15:30-1時0").is_err());
     }
 }
